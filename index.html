@@ -1409,7 +1409,10 @@ function capSwing(key, p) {
   for (let i = 0; i < n; i++) {
     const pts = new Array(33);
     CAP_J.forEach((jn, k) => { pts[jn] = at(i, k * 3, 1000); });
-    const H = at(i, 48, 1000), gaze = norm(at(i, 51, 10000)), G = at(i, 54, 1000), d = norm(at(i, 57, 10000));
+    const H = at(i, 48, 1000), gaze = norm(at(i, 51, 10000)), d = norm(at(i, 57, 10000));
+    // the capture reads the finish hands low (one camera's depth); the footage has them clearly above the head, so
+    // they rise into place over the follow-through
+    const fu = M.P ? Math.max(0, Math.min(1, (i - M.P[8]) / Math.max(1, M.P[9] - M.P[8]))) : 0, G = add(at(i, 54, 1000), [0, .08 * fu * fu * (3 - 2 * fu), 0]);
     const lat = norm(cross(gaze, UP)), hu = norm(cross(lat, gaze));
     pts[0] = add(H, mul(gaze, .10));
     const eye = sgn => add(add(add(H, mul(gaze, .075)), mul(hu, .03)), mul(lat, -sgn * .035));
@@ -1641,7 +1644,7 @@ function analyze(src) {
   };
   // a real swing lifts the hands at least most of a torso length, over several frames, then comes back down
   a.swingOK = (hands[P[0]].y - hands[P[3]].y) > .45 * L0 && P[3] - P[0] >= 3 && a.bsTime >= .3 && (hands[P[6]].y - hands[P[3]].y) > .35 * L0;
-  a.ball = estimateBall(a); a.club = clubTrack(a);
+  a.ball = estimateBall(a); a.club = a.clubBad ? null : clubTrack(a);   // a clubhead that never sat on the ground is not drawn
   // driver or iron: found from the setup, unless the golfer said which
   a.clubGuess = synth ? { club: clubOf(src.clubKind), conf: 1, cues: 0 } : detectClub(a);
   a.clubKind = src.clubKind ? clubOf(src.clubKind) : a.clubGuess.club;
@@ -1664,7 +1667,10 @@ function faceOnTurn(lm, i1, i4, a, b) {
 // down the line, follow a typical 55° shaft from the hands to the ground; face-on, just inside the lead foot.
 function estimateBall(a) {
   const i1 = a.P[0], f = a.lm[i1], h = a.hands[i1], mir = p => ({ x: a.hand === 'L' ? a.src.w - p.x : p.x, y: p.y });
-  if (a.src.club0) return mir(a.src.club0);
+  // a clubhead found at address is used only if it sits where a clubhead can: on the ground by the feet, a club's length
+  // from the hands (otherwise a lamp, a hip or a ball basket would swing every plane line off)
+  if (a.src.club0) { const c = mir(a.src.club0), gy0 = Math.max(f[27].y, f[28].y, f[29].y, f[30].y, f[31].y, f[32].y), d = Math.hypot(c.x - h.x, c.y - h.y);
+    if (Math.abs(c.y - gy0) < .35 * a.L && d > 1.1 * a.L && d < 2.8 * a.L && c.y > h.y) return c; a.clubBad = true; }
   if (a.src.synthetic && a.src.club) return mir(a.src.club[i1].head);
   if (a.src.synthetic && a.src.ballPx) return mir(a.src.ballPx);
   const gy = Math.max(f[31].y, f[32].y, f[29].y, f[30].y);
@@ -2401,6 +2407,9 @@ function buildFigure() {
     add('thigh' + s, taper(.09, .066, .395), 'pants');
     add('knee' + s, ellip(.064, .064, .064), 'pants');
     add('shin' + s, taper(.062, .045, .45), 'pants');
+    // trouser hem over the shoe: carries the leg down to the shoe so there is never a gap at the ankle
+    add('cuff' + s, taper(.056, .064, .12), 'pants');
+    add('collar' + s, ellip(.043, .036, .062), 'shoe');
     add('shoe' + s, (() => { const g = new T.CapsuleGeometry(.046, .17, 6, 16); g.rotateX(Math.PI / 2); g.scale(1.05, .72, 1); return g; })(), 'shoe');
     add('sole' + s, (() => { const g = new T.CapsuleGeometry(.05, .17, 4, 16); g.rotateX(Math.PI / 2); g.scale(1.08, .2, 1.02); return g; })(), 'sole');
   }
@@ -2428,7 +2437,7 @@ function buildFigure() {
   for (const k of ['m', 'f']) { try { f.chars[k] = buildChar(CHAR_SETS[k]); } catch (e) { f.chars[k] = null; } if (f.chars[k]) { f.chars[k].mesh.visible = false; f.root.add(f.chars[k].mesh); } }
   if (!f.chars.m) f.chars.m = f.chars.f; if (!f.chars.f) f.chars.f = f.chars.m;
   f.char = null; useChar(f, 'm');
-  if (f.char) for (const k in f.parts) if (!['cap', 'brim', 'shoeL', 'shoeR', 'soleL', 'soleR'].includes(k)) f.parts[k].visible = false;   // the body replaces the primitives
+  if (f.char) for (const k in f.parts) if (!['cap', 'brim', 'shoeL', 'shoeR', 'soleL', 'soleR', 'cuffL', 'cuffR', 'collarL', 'collarR'].includes(k)) f.parts[k].visible = false;   // the body replaces the primitives
   return f;
 }
 /* ---------- the character: one skinned golfer, posed every frame from the swing's joint points ----------
@@ -2652,7 +2661,7 @@ function useChar(f, which) {
   if (f.char) f.char.mesh.visible = false;
   f.char = c; c.mesh.visible = true;
   const hs = c.r.headR / .093 * 1.12; f.parts.cap.scale.set(hs, hs, hs * 1.13); f.parts.brim.scale.set(hs, hs, hs * 1.13);   // a real head is longer front to back than the old one
-  const fs = which === 'f' ? .9 : 1; for (const k of ['shoeL', 'shoeR', 'soleL', 'soleR']) f.parts[k].scale.setScalar(fs);
+  const fs = which === 'f' ? .9 : 1; for (const k of ['shoeL', 'shoeR', 'soleL', 'soleR', 'collarL', 'collarR']) f.parts[k].scale.setScalar(fs);
 }
 function setMats(f, key, ghost, hi) {
   const m = mats(key);
@@ -2700,6 +2709,14 @@ function ortho(y, zHint) { const yy = y.clone().normalize(), z = zHint.clone().s
 function pose(f, fr, model) {
   if (f.char) { poseChar(f.char, fr); poseClub(f, fr, model);
     const P = fr.pts.map(vec); shoe(f, 'L', P[29], P[31]); shoe(f, 'R', P[30], P[32]);
+    // ankles: the trouser hem runs from low on the shin down over the top of the shoe, and the shoe's heel counter
+    // rises to meet it
+    for (const [s, K, A] of [['L', P[25], P[27]], ['R', P[26], P[28]]]) {
+      const dn = A.clone().sub(K).normalize(), top = A.clone().addScaledVector(dn, -.11), bot = A.clone().addScaledVector(dn, .02);
+      const shoeTop = f.parts['shoe' + s].position.y + .02; if (bot.y < shoeTop) bot.y = shoeTop;
+      place(f.parts['cuff' + s], top, bot); f.parts['cuff' + s].scale.set(1, top.distanceTo(bot) / .12, 1);
+      f.parts['collar' + s].position.set(A.x, Math.max(f.parts['shoe' + s].position.y + .012, A.y - .045), A.z); f.parts['collar' + s].quaternion.copy(f.parts['shoe' + s].quaternion);
+    }
     // the cap rides on the head: placed at the skull centre, facing where the face does
     _m4.setFromMatrix3(f.char.headR); f.head.quaternion.setFromRotationMatrix(_m4); f.head.position.copy(f.char.headC).addScaledVector(new T.Vector3(f.char.headR.elements[3], f.char.headR.elements[4], f.char.headR.elements[5]), (f.char.r.headTop - f.char.r.headC.y) + .01 - .12 * f.parts.cap.scale.y)
       .addScaledVector(new T.Vector3(f.char.headR.elements[6], f.char.headR.elements[7], f.char.headR.elements[8]), .01);   // forward over the brow
@@ -2884,7 +2901,7 @@ const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const DPR = Math.min(2.5, window.devicePixelRatio || 1);
 // Shown in settings and at the foot of the home screen, so it's always clear which build the phone is running
-const BUILD = 'Version 7, October 29', SW_VER = 'lagline-v7';
+const BUILD = 'Version 8, October 29', SW_VER = 'lagline-v8';
 // A Home Screen app can sit in memory for days. When it comes back to the front, check (with a 1 KB request) whether
 // a newer version has been uploaded, and offer to load it.
 let updAt = 0;
@@ -3089,6 +3106,8 @@ function drawPlaneLines(g, an, M, i) {
   g.lineWidth = 2;
   if (an.view === 'DTL') {
     const hands1 = M(an.hands[i1]), neck1 = M(an.ms[i1]);
+    // the planes rise from a ball on the ground, below the hands; anything else is a bad ball reading, not a plane
+    if (!(ball.y > hands1.y + 20 && ball.y > neck1.y + 20)) return;
     const ext = (a, b) => { const dx = b.x - a.x, dy = b.y - a.y, l = Math.hypot(dx, dy) || 1; return { x: a.x + dx / l * 3000, y: a.y + dy / l * 3000 }; };
     poly(g, [ball, ext(ball, hands1), ext(ball, neck1)]); g.fillStyle = 'rgba(255,106,85,.09)'; g.fill();
     g.strokeStyle = C.plane; lineThrough(g, ball, hands1);
@@ -3099,9 +3118,9 @@ function drawPlaneLines(g, an, M, i) {
     g.strokeStyle = 'rgba(235,240,234,.45)'; g.setLineDash([3, 5]); seg(g, { x: top.x - 70, y: top.y }, { x: top.x + 70, y: top.y }); g.setLineDash([]);
     g.strokeStyle = C.fg; g.lineWidth = 2.5; seg(g, M(an.mh[i]), M(an.ms[i]));
     g.strokeStyle = 'rgba(235,240,234,.4)'; g.lineWidth = 1.5; g.setLineDash([4, 5]); seg(g, M(mh1), M(an.ms[i1])); g.setLineDash([]);
-    // name plates on one row just above the ball, each on the outer side of the line it names (the two planes meet at
-    // the ball, so each plate sits outside the wedge between them, never inside it)
-    let yb = ball.y - 28; if (tagGate) yb = clamp(yb, tagGate.minY + 9.5, tagGate.maxY + 9.5);
+    // name plates on one row along the bottom, each on the outer side of the line it names
+    // (always the bottom row of the picture, as asked; never mid-frame)
+    const yb = tagGate ? tagGate.maxY + 9.5 : g.canvas.height / DPR - 24;
     const at = (a, b) => b.x + (yb - b.y) * (b.x - a.x) / ((b.y - a.y) || 1);
     const xs = at(hands1, ball), xh = at(neck1, ball), mid = (xs + xh) / 2;
     const out = (x, text, col, left) => (left ? { x: x - 7, text, col, align: 'right' } : { x: x + 7, text, col });
@@ -3118,7 +3137,7 @@ function drawPlaneLines(g, an, M, i) {
     g.strokeStyle = C.plane; lineThrough(g, M(f[11]), M(f[12]));
     g.strokeStyle = 'rgba(255,106,85,.55)'; lineThrough(g, M(f[23]), M(f[24]), [6, 5]);
     g.fillStyle = '#F6F7F3'; g.strokeStyle = C.flag; g.lineWidth = 2; g.beginPath(); g.arc(ball.x, ball.y, 5, 0, Math.PI * 2); g.fill(); g.stroke();
-    let yr = Math.max(tr.y, ld.y) + 300; if (tagGate) yr = clamp(yr, tagGate.minY + 9.5, tagGate.maxY + 9.5);
+    const yr = tagGate ? tagGate.maxY + 9.5 : g.canvas.height / DPR - 24;
     tagRow(g, yr, [{ x: tr.x - 4, text: 'Trail hip', col: C.trace, align: 'right' }, { x: ld.x + 4, text: 'Lead hip', col: C.trace }]);
     tag(g, { x: hd1.x, y: hd1.y - Math.abs(r) - 14 }, 'Head', C.fg2, 'center');
   }
@@ -3173,7 +3192,8 @@ function denseClub(an) {
   an._clubD = { src: c, pts }; return pts;
 }
 function drawClubPath(g, an, M, i) {
-  const c = an.club; if (!c || !c[i]) return false;
+  const c = an.club; if (!c) return false;
+  if (!c[i]) { let j = i; while (j > 0 && !c[j]) j--; if (!c[j] || j < an.P[6]) return false; i = j; }   // the line stopped where the club was lost
   const P = an.P, D = denseClub(an), H = D.map(ps => ps.map(M));
   const segs = [[P[0], P[3], 'rgba(190,168,255,.95)'], [P[3], P[6], 'rgba(255,128,214,.95)'], [P[6], P[9], 'rgba(235,240,234,.75)']];
   g.lineCap = 'round'; g.lineJoin = 'round';
@@ -3637,66 +3657,81 @@ function solveClubNet(track, an, T) {
   const sig = i => Lc * Math.max(.06, [.03, .7, .7, .9, .8, .4][ph(i)] * vPh[ph(i)]);
   const reward = s => 3 * Math.min(1, s), MISS = 1.2, JUMP = 7;
   // address: the median of confident early detections, below the hands and out by the feet
-  const early = []; for (let i = Math.max(0, P[0] - 10); i <= Math.min(n - 1, P[0] + 2); i++) for (const c of cand[i]) { const dx = c.p[0] - sgx[i], dy = c.p[1] - sgy[i], l = Math.hypot(dx, dy); if (c.s > .3 && !c.sh && dy > .35 * l && l > .55 * Lc) early.push(c.p); }
+  // (and it rests on the ground: level with the feet, give or take, never up by the hips)
+  const fA = an.lm && an.lm[Math.min(P[0], an.lm.length - 1)], footY = fA ? Math.max(...[27, 28, 29, 30, 31, 32].map(j => (fA[j] ? fA[j].y : -Infinity))) : null;
+  const onGround = q => footY == null || !Lt || Math.abs(q[1] - footY) < .35 * Lt;
+  const early = []; for (let i = Math.max(0, P[0] - 10); i <= Math.min(n - 1, P[0] + 2); i++) for (const c of cand[i]) { const dx = c.p[0] - sgx[i], dy = c.p[1] - sgy[i], l = Math.hypot(dx, dy); if (c.s > .3 && !c.sh && dy > .35 * l && l > .55 * Lc && onGround(c.p)) early.push(c.p); }
   const pA = early.length ? [med(early.map(q => q[0])), med(early.map(q => q[1]))] : null;
-  // what a swing looks like, as a prior the readings are weighed against:
-  //  - the clubhead stays near the plane line: from the ball up through the hands at address (down the line, the shaft
-  //    plane; it climbs above it only round the top)
-  //  - coming down, it retraces the way it went back: at each hand height on the way down, the clubhead is near where
-  //    it was at that hand height on the way up
-  const g0 = [sgx[Math.min(P[0], n - 1)], sgy[Math.min(P[0], n - 1)]];
-  const plane = pA ? (() => { const ux = g0[0] - pA[0], uy = g0[1] - pA[1], l = Math.hypot(ux, uy) || 1; return q => Math.abs((q[0] - pA[0]) * uy / l - (q[1] - pA[1]) * ux / l); })() : null;
-  let yTop = Infinity; for (let i = P[0]; i <= Math.min(n - 1, P[6]); i++) yTop = Math.min(yTop, sgy[i]);
-  const prog = i => Math.max(0, Math.min(1, (g0[1] - sgy[i]) / Math.max(1, g0[1] - yTop)));
-  const run = (back) => {
-    let st = [{ cost: 0, d: pA, v: [0, 0], k: -1, back: null }];
+  // A rough path first, then the readings decide. Some frames say far more about where the club goes than others:
+  // address (the clubhead on the ball), the top, impact (back on the ball) and the other P positions. The clearest
+  // reading near each becomes an anchor, and straight lines between anchors give a first guess of the path, loose in
+  // the middle of a long stretch, tight near an anchor. Each candidate is weighed against that guess (capped, so a
+  // clear reading always wins). The fit then supplies more anchors (every frame it is sure of), the guess is redrawn
+  // through them, its weight lowered, and the fit run again: each round leans more on what the video shows.
+  const i7 = Math.min(n - 1, P[6]);
+  const lenOK = (q, i, lo) => { const l = Math.hypot(q[0] - sgx[i], q[1] - sgy[i]); return l > (lo == null ? .45 : lo) * Lc && l < 1.3 * Lc; };
+  const seedAnchors = () => {
+    const A = []; if (pA) { A.push({ i: Math.min(P[0], n - 1), p: pA, w: 1 }); A.push({ i: i7, p: pA, w: .7 }); }
+    const rad = Math.max(1, Math.round((P[9] - P[0]) / 60));
+    for (const k of [1, 2, 3, 4, 5]) {   // (after impact the readings are too unsure to anchor anything)
+      const c0 = Math.min(n - 1, P[k]); let best = null;
+      for (let i = Math.max(0, c0 - rad); i <= Math.min(n - 1, c0 + rad); i++) for (const c of cand[i]) if (!c.sh && c.s >= .45 && lenOK(c.p, i, k === 3 ? .25 : .45) && (!best || c.s > best.w)) best = { i, p: c.p, w: c.s };
+      if (best) A.push(best);
+    }
+    return A;
+  };
+  const anchorsFrom = (pk, A0) => { const A = A0.filter(a => a.w >= 1 || a.i === i7);
+    for (let i = 0; i < n; i++) { const q = pk[i]; if (q.k >= 0 && q.s >= .4 && lenOK(q.d, i, .25)) A.push({ i, p: q.d, w: Math.min(1, q.s) }); }
+    return A; };
+  const guide = A => {   // straight lines through the anchors, in time order; how sure it is depends on how close an anchor is
+    const S = A.slice().sort((x, y) => x.i - y.i), u = []; for (const a of S) if (!u.length || u[u.length - 1].i !== a.i) u.push(a); else if (a.w > u[u.length - 1].w) u[u.length - 1] = a;
+    return i => { if (!u.length) return null; let j = 0; while (j < u.length && u[j].i < i) j++;
+      if (j < u.length && u[j].i === i) return { p: u[j].p, sd: .1 * Lc };
+      const a = u[j - 1], b = u[j]; if (!a) return { p: b.p, sd: Lc * (.15 + .05 * (b.i - i)) }; if (!b) return { p: a.p, sd: Lc * (.15 + .05 * (i - a.i)) };
+      const t = (i - a.i) / (b.i - a.i), ch = Math.hypot(b.p[0] - a.p[0], b.p[1] - a.p[1]);
+      return { p: [a.p[0] + (b.p[0] - a.p[0]) * t, a.p[1] + (b.p[1] - a.p[1]) * t], sd: .12 * Lc + 1.1 * t * (1 - t) * ch }; }; };
+  const run = (G, wPri) => {
+    let st = [{ cost: 0, d: pA, v: [0, 0], k: -1, m: 0, back: null }];
     for (let i = 0; i < n; i++) {
       const cs = cand[i], s = sig(i), nxt = cs.map(() => null), P_ = ph(i); let miss = null;
       const anc = d => { if (!pA || i > P[0]) return 0; const q = Math.hypot(d[0] - pA[0], d[1] - pA[1]) / (.1 * Lc); return q * q; };
-      const mir = back && i > P[3] && i <= Math.min(n - 1, P[6] + 1) ? back(prog(i)) : null;
+      const gi = G ? G(i) : null;
       const pri = d => { let e = 0;
-        if (mir) { const q = Math.hypot(d[0] - mir[0], d[1] - mir[1]) / (.3 * Lc); e += q * q; }
-        if (plane && an.view === 'DTL' && (i < P[2] || P_ === 3)) { const q = Math.max(0, plane(d) - .2 * Lc) / (.3 * Lc); e += q * q; }
+        // through the strike the club is out at full length from the hands
+        if (i >= P[5] && i <= i7 + 1) { const l = Math.hypot(d[0] - sgx[i], d[1] - sgy[i]), q = Math.max(0, .65 * Lc - l) / (.15 * Lc); e += q * q; }
+        if (gi && i <= i7 + 1) { const q = Math.hypot(d[0] - gi.p[0], d[1] - gi.p[1]) / gi.sd; e += wPri * Math.min(4, q * q); }
         return e; };
       for (const p of st) {
-        let pr = p.d ? [p.d[0] + p.v[0], p.d[1] + p.v[1]] : null;
+        const pr = p.d ? [p.d[0] + p.v[0], p.d[1] + p.v[1]] : null;
+        const sw = s * (1 + .6 * (p.m || 0));   // unseen for a while: less sure where it is, so search wider
         for (let k = 0; k < cs.length; k++) {
           const d = cs[k].p; let c;
-          if (pr) { const e = Math.hypot(d[0] - pr[0], d[1] - pr[1]) / s; c = p.cost + e * e - reward(cs[k].s); } else c = p.cost + 2 - reward(cs[k].s);
+          if (pr) { const e = Math.hypot(d[0] - pr[0], d[1] - pr[1]) / sw; c = p.cost + e * e - reward(cs[k].s); } else c = p.cost + 2 - reward(cs[k].s);
           c += anc(d) + pri(d);
           const v = p.d && p.k >= 0 ? [d[0] - p.d[0], d[1] - p.d[1]] : [0, 0];
-          if (!nxt[k] || c < nxt[k].cost) nxt[k] = { cost: c, d, v, k, s: cs[k].s, back: p };
-          // (picking the club up again after losing it only going back: after the strike a jump lands on scenery)
-          if (pr && (P_ === 1 || P_ === 2)) { const c2 = p.cost + JUMP - reward(cs[k].s) + pri(d); if (c2 < nxt[k].cost) nxt[k] = { cost: c2, d, v: [0, 0], k, s: cs[k].s, back: p }; }
+          if (!nxt[k] || c < nxt[k].cost) nxt[k] = { cost: c, d, v, k, s: cs[k].s, m: 0, back: p };
+          if (pr && (P_ === 1 || P_ === 2)) { const c2 = p.cost + JUMP - reward(cs[k].s) + pri(d); if (c2 < nxt[k].cost) nxt[k] = { cost: c2, d, v: [0, 0], k, s: cs[k].s, m: 0, back: p }; }
         }
-        // no reading: carry on, drawn toward the way the club went back
-        if (pr && mir) pr = [.5 * pr[0] + .5 * mir[0], .5 * pr[1] + .5 * mir[1]];
-        const c = p.cost + MISS + (pr ? pri(pr) * .3 : 0);
-        if (!miss || c < miss.cost) miss = { cost: c, d: pr, v: P_ === 3 ? p.v : [p.v[0] * .85, p.v[1] * .85], k: -1, s: 0, back: p };
+        // no reading this frame: coast toward the guide (never fly on at full speed: unseen, the club is assumed to slow,
+        // except through the strike)
+        let pm = pr; if (pm && gi) { const g = Math.min(.6, wPri * .5); pm = [pm[0] * (1 - g) + gi.p[0] * g, pm[1] * (1 - g) + gi.p[1] * g]; }
+        const dk = P_ === 3 ? 1 : .6, c = p.cost + MISS + (pm ? pri(pm) * .3 : 0);
+        if (!miss || c < miss.cost) miss = { cost: c, d: pm, v: [p.v[0] * dk, p.v[1] * dk], k: -1, s: 0, m: (p.m || 0) + 1, back: p };
       }
       st = nxt.filter(Boolean).concat([miss]);
     }
-    let best = st.reduce((a, b) => (b.cost < a.cost ? b : a)); const pk = new Array(n);
+    let best = st.reduce((x, y) => (y.cost < x.cost ? y : x)); const pk = new Array(n);
     for (let i = n - 1; i >= 0; i--) { pk[i] = best; best = best.back; }
     return pk;
   };
-  let pick = run(null);
-  // the way back, as clubhead position against how far the hands had risen
-  const bref = []; if (pA) bref.push([0, pA[0], pA[1]]);
-  for (let i = P[0] + 1; i <= Math.min(n - 1, P[3]); i++) if (pick[i].k >= 0) bref.push([prog(i), pick[i].d[0], pick[i].d[1]]);
-  let backAt = null;
-  if (bref.length >= 4) {
-    bref.sort((a, b) => a[0] - b[0]);
-    backAt = u => { let lo = bref[0], hi = bref[bref.length - 1]; for (const r of bref) { if (r[0] <= u && r[0] >= lo[0]) lo = r; if (r[0] >= u && r[0] <= hi[0]) hi = r; }
-      const t = hi[0] - lo[0] > 1e-6 ? (u - lo[0]) / (hi[0] - lo[0]) : 0; return [lo[1] + (hi[1] - lo[1]) * t, lo[2] + (hi[2] - lo[2]) * t]; };
-    pick = run(backAt);
-  }
+  const A0 = seedAnchors();
+  let Gd = guide(A0), pick = run(Gd, 1);
+  for (const w of [.6, .35]) { Gd = guide(anchorsFrom(pick, A0)); pick = run(Gd, w); }
+  const backAt = null;
   const good = pick.filter(q => q.k >= 0).length; if (good < .3 * n) return null;
   // at impact the clubhead is back at the ball: when the strike was a blur, that is the reading the downswing ends on
   { const i7 = Math.min(n - 1, P[6]); if (pA && ![i7 - 1, i7, i7 + 1].some(j => pick[j] && pick[j].k >= 0)) pick[i7] = { k: -2, d: pA, s: .8, imp: true }; }
   for (const q of pick) if (q.k === -2) q.k = 99;
-  // blurred downswing frames with no reading: the mirrored backswing stands in, weakly
-  if (backAt) for (let i = P[3] + 1; i < Math.min(n, P[6]); i++) if (pick[i].k < 0) pick[i] = { k: 98, d: backAt(prog(i)), s: .05, imp: true };
   // smooth the picks and fill the gaps; firm while the club is slow, loose through the strike
   const px = pick.map(q => (q.k >= 0 ? q.d[0] : null)), py = pick.map(q => (q.k >= 0 ? q.d[1] : null)), w = pick.map(q => (q.k >= 0 ? .4 + Math.min(1, q.s) : 0));
   const lam = px.map((_, i) => { const v = Math.max(vPh[ph(i)], .03); return [20, .004, .004, .0015, .003, .05][ph(i)] / (v * v); });
@@ -3716,6 +3751,12 @@ function solveClubNet(track, an, T) {
   if (idxs.length) { for (let q = 0; q < idxs[0]; q++) { fx[q] = sx[idxs[0]]; fy[q] = sy[idxs[0]]; } const L = idxs[idxs.length - 1]; for (let q = L + 1; q < n; q++) { fx[q] = sx[L]; fy[q] = sy[L]; } }
   const out = [];
   for (let q = 0; q < n; q++) out.push({ gx: sgx[q], gy: sgy[q], hx: fx[q], hy: fy[q], est: pick[q].k < 0 || !!pick[q].imp });
+  // after impact: the path is drawn only as long as the club is actually being followed; once it is lost (a few
+  // frames unseen, or a jump no club makes) the line stops rather than wander off to a lamp or a ball basket
+  { let miss = 0; for (let q = i7 + 1; q < n; q++) {
+      const jump = Math.hypot(out[q].hx - out[q - 1].hx, out[q].hy - out[q - 1].hy) > .55 * Lc, far = Math.hypot(out[q].hx - out[q].gx, out[q].hy - out[q].gy) > 1.3 * Lc;
+      miss = pick[q].k < 0 ? miss + 1 : 0;
+      if (miss >= 3 || jump || far) { for (let r = q; r < n; r++) out[r] = null; break; } } }
   const i1 = Math.min(P[0], n - 1), head0 = pA ? { x: pA[0], y: pA[1] } : { x: out[i1].hx, y: out[i1].hy };
   return { frames: out, head0, quality: good / n, net: true };
 }
@@ -4074,7 +4115,7 @@ function drawAnalysis() {
     tagGate = { on: !S.playing, minY: 64 - off, maxY: $('.pl-bottom').offsetTop + top - 30 - off }; }
   if (L.bars) drawBars(g, an, M, i);
   if (L.lines) drawPlaneLines(g, an, M, i);
-  if (L.path) { const tr = S.tracer, hasClub = !!(an.club && an.club[i]); if (tr === 'hands' || tr === 'both' || !hasClub) drawPath(g, an, M, i); if ((tr === 'club' || tr === 'both') && hasClub) drawClubPath(g, an, M, i); }
+  if (L.path) { const tr = S.tracer, hasClub = !!(an.club && (an.club[i] || an.club[an.P[6]])); if (tr === 'hands' || tr === 'both' || !hasClub) drawPath(g, an, M, i); if ((tr === 'club' || tr === 'both') && hasClub) drawClubPath(g, an, M, i); }
   if (L.head) drawHead(g, an, M, i);
   let j = null;
   if (pr) {
@@ -5307,7 +5348,7 @@ function initHero() {
     }
   });
   { const an0 = LG.proRun(hero.id, 'DTL').an; hero.t = an0.times[an0.P[3]]; hero.playing = false; setTimeout(() => { hero.playing = true; }, 1200); }   // open on the top of the swing
-  watch(hero); who();
+  watch(hero); who(); window.__hero = hero;
 }
 function updateSetupLine() {
   const v = { auto: 'camera angle detected automatically', FO: 'filming face-on', DTL: 'filming down the line' }[S.viewPref];
