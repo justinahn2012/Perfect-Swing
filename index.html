@@ -1542,12 +1542,23 @@ function idxAt(times, t) {
 function argRange(arr, a, b, cmp) { let k = a; for (let i = a; i <= b; i++) if (cmp(arr[i], arr[k])) k = i; return k; }
 // Hand-height fractions that mark P2/P3/P5/P6 (of the address→top rise) and P8/P9 (of the impact→finish rise)
 const PF = { p2: .14, p3: .55, p5: .52, p6: .16, p8: .22, p9: .62 };
-function detectP(hands, times, L, view) {
-  const n = hands.length, y = hands.map(p => p.y);
+function detectP(hands, times, L, view, impAt) {
+  // (a median over 5 frames first: a one-frame jump in the pose, at a cut or a fade, is not a hand movement)
+  const n = hands.length, y0_ = hands.map(p => p.y), y = y0_.map((_, i) => { const w = y0_.slice(Math.max(0, i - 2), Math.min(n, i + 3)).sort((a, b) => a - b); return w[w.length >> 1]; });
   const dd = (arr, i) => { const a = Math.max(0, i - 1), b = Math.min(n - 1, i + 1); return (arr[b] - arr[a]) / ((times[b] - times[a]) || 1); };
   const vy = y.map((_, i) => dd(y, i));
   const sp = hands.map((_, i) => { const a = Math.max(0, i - 1), b = Math.min(n - 1, i + 1); return d2(hands[b], hands[a]) / ((times[b] - times[a]) || 1); });
-  let iD = 0; for (let i = 1; i < n; i++) if (vy[i] > vy[iD]) iD = i;
+  // the fastest the hands come down, but only a drop that ends with the hands back down at the ball (a camera cut,
+  // a fade or a jump in the pose at the end of the clip can be "fast" too)
+  let yLowest = -Infinity; for (let i = 0; i < n; i++) yLowest = Math.max(yLowest, y[i]);
+  const reachesBall = i => { for (let j = i; j < n && times[j] - times[i] < 1.2 * Math.max(1, (times[n - 1] - times[0]) / 4); j++) if (y[j] > yLowest - .7 * L) return true; return false; };
+  const teleport = i => Math.abs(y0_[Math.min(n - 1, i + 1)] - y0_[Math.max(0, i - 1)]) > .8 * L;   // a jump no hands make in a frame
+  // and preferably one the hands climb back up from (the follow-through): a drop at the very end of a clip that is
+  // only a fade or a cut has nothing after it
+  const risesAfter = i => { let lo = -Infinity, k = i; for (; k < n && y[k] >= lo - .02 * L; k++) lo = Math.max(lo, y[k]); for (let j = k; j < n; j++) if (y[j] < lo - .5 * L) return true; return false; };
+  let iD = -1; for (let i = 1; i < n - 3; i++) if ((iD < 0 || vy[i] > vy[iD]) && !teleport(i) && reachesBall(i) && risesAfter(i)) iD = i;
+  if (iD < 0) for (let i = 1; i < n - 3; i++) if ((iD < 0 || vy[i] > vy[iD]) && !teleport(i) && reachesBall(i)) iD = i;
+  if (iD < 0) { iD = 0; for (let i = 1; i < n; i++) if (vy[i] > vy[iD]) iD = i; }
   let iTop = argRange(y, idxAt(times, times[iD] - 1.6), iD, (a, b) => a < b);
   // a golfer who pauses at the top: the top is the end of the pause (when the hands start down), not its start
   { const ym = y[iTop]; for (let i = iD; i > iTop; i--) if (y[i] <= ym + .03 * L) { iTop = i; break; } }
@@ -1557,7 +1568,10 @@ function detectP(hands, times, L, view) {
   for (let i = iTop; i >= a0; i--) if (y[i] >= yLow - .035 * L) { iAddr = i; break; }
   while (iAddr > a0 && sp[iAddr] > .25 * L) iAddr--;
   const tgt = { x: hands[iAddr].x + (view === 'FO' ? .14 * L : 0), y: hands[iAddr].y - .06 * L };
-  const iImp = argRange(hands.map(h => d2(h, tgt)), iTop + 1, Math.max(idxAt(times, times[iTop] + .6), idxAt(times, times[iD] + .3)), (a, b) => a < b);
+  // impact: where the hands come back to the address spot, unless the club itself has been tracked (impAt: the
+  // frame the clubhead bottoms out), which is the better witness
+  const iImp = impAt != null && impAt > iTop && impAt < n - 1 ? impAt
+    : argRange(hands.map(h => d2(h, tgt)), iTop + 1, Math.max(idxAt(times, times[iTop] + .6), idxAt(times, times[iD] + .3)), (a, b) => a < b);
   let iFin = argRange(y, iImp, idxAt(times, times[iImp] + 1.6), (a, b) => a < b);
   { const ym = y[iFin]; for (let i = iImp; i <= iFin; i++) if (y[i] <= ym + .015 * L) { iFin = i; break; } }
   const rise = Math.max(1e-6, y[iAddr] - y[iTop]), f = i => (y[iAddr] - y[i]) / rise;
@@ -1598,10 +1612,27 @@ function analyze(src) {
   const autoView = ratio > .5 ? 'FO' : 'DTL';
   const view = (!src.view || src.view === 'auto') ? autoView : src.view;
   const hands = lm.map(f => (synth ? mid(f[15], f[16]) : gripPt(f)));   // real video: the wrists lag the grip, so use the hand points too
-  let P = src.Pidx && src.Pidx.length === 10 ? src.Pidx.slice() : detectP(hands, times, L0, view);
-  for (let r = 0; r < (src.Pidx ? 0 : 2); r++) {   // slow-motion: a 0.9 s backswing that takes 2 s or more on the clock
-    const bs = times[P[3]] - times[P[0]]; if (bs <= 1.6) break;
-    const k = bs / .9; P = detectP(hands, times.map(t => t / k), L0, view);
+  let P = src.Pidx && src.Pidx.length === 10 ? src.Pidx.slice() : detectP(hands, times, L0, view, src.impAt);
+  // slow-motion: a 0.9 s backswing that takes 2 s or more on the clock. Each pass can only look so far back for
+  // the address, so a heavily slowed swing (10 s backswings in a slow-mo saved at normal speed) takes a few passes
+  // to settle; stop once the slow-down factor stops growing.
+  const settle = Q => {
+    for (let r = 0, kPrev = 1; r < 6; r++) {
+      const bs = times[Q[3]] - times[Q[0]]; if (bs <= 1.6) break;
+      const k = bs / .9; if (k < kPrev * 1.08) break;
+      Q = detectP(hands, times.map(t => t / k), L0, view, src.impAt); kPrev = k;
+    }
+    return Q;
+  };
+  if (!src.Pidx) {
+    P = settle(P);
+    // so slowed that the search windows only see the top (the hands barely rise from "address" to "top"):
+    // look again on slower and slower clocks until a real backswing shows
+    const rise = Q => hands[Q[0]].y - hands[Q[3]].y;
+    if (rise(P) < .45 * L0) for (const k of [2, 4, 8, 16]) {
+      const Q = settle(detectP(hands, times.map(t => t / k), L0, view, src.impAt));
+      if (rise(Q) >= .45 * L0) { P = Q; break; }
+    }
   }
   const i1 = P[0], L = torsoAt(i1) || L0;
   const toIn = px => px / L * IN_PER_TORSO;
@@ -1982,30 +2013,34 @@ function scanSample(f) {
   return { hgt: (hp.y - wr.y) / L, tog: d2(f[15], f[16]) / L, ank: mid(f[27], f[28]), L };
 }
 function findSwings(samples, dur) {
+  // k: how slowed-down this swing is. A real backswing takes the hands from address height to above the shoulders
+  // in about half a second; a slow-motion clip saved at normal speed (an iPhone Slo-mo exported, or a replay) can
+  // take 5 to 20 times that. Every time limit below stretches by k, so a slowed swing stays one swing.
   const LOW = .4, HIGH = .8, SETTLE = 1.3, ok = samples.filter(s => s && s.L > 0), tops = [];
-  let armed = true, lowFrom = null, cur = null;
+  let armed = true, lowFrom = null, cur = null, since = -Infinity;
   for (const s of ok) {
     if (s.hgt < LOW) {
       if (lowFrom == null) lowFrom = s.t;
-      if (s.t - lowFrom >= SETTLE) { armed = true; if (cur && cur.settle == null) cur.settle = lowFrom; }
+      if (s.t - lowFrom >= SETTLE * (cur ? cur.k : 1)) { armed = true; if (cur && cur.settle == null) cur.settle = lowFrom; since = lowFrom; }
     } else if (s.hgt > LOW + .1) lowFrom = null;
     if (!armed || s.hgt < HIGH || s.tog > .75) continue;
-    const near = ok.filter(q => q.t >= s.t - 3 && q.t <= s.t);
-    if (!near.some(q => q.hgt < LOW + .1)) continue;                       // no address before it
-    const feet = ok.filter(q => q.t >= s.t - 1 && q.t <= s.t + .2).map(q => q.ank.x);
+    let addr = null; for (const q of ok) { if (q.t >= s.t) break; if (q.t >= since && q.hgt < LOW) addr = q.t; }   // hands last low going back
+    if (addr == null) continue;                                             // no address before it
+    const k = Math.max(1, Math.min(20, (s.t - addr) / .45));
+    if (s.t - addr > 3 * k) continue;
+    const feet = ok.filter(q => q.t >= s.t - 1 * k && q.t <= s.t + .2 * k).map(q => q.ank.x);
     if ((Math.max(...feet) - Math.min(...feet)) / s.L > .45) continue;    // walking, not swinging
-    let addr = s.t; for (const q of ok) { if (q.t >= s.t) break; if (q.hgt < LOW) addr = q.t; }   // hands last low going back
-    cur = { t: s.t, addr, settle: null }; tops.push(cur); armed = false; lowFrom = null;
+    cur = { t: s.t, addr, settle: null, k }; tops.push(cur); armed = false; lowFrom = null;
   }
   // Each window runs from well before the takeaway to just after the hands drop from the finish. Using what the
   // hands actually did (not fixed seconds) keeps slow-motion clips whole.
   const wins = []; let prevEnd = 0;
   tops.forEach((tp, n) => {
-    const next = tops[n + 1];
-    const a = Math.max(prevEnd, Math.min(tp.t - 2.2, tp.addr - 1.0), tp.t - 10, 0);   // enough lead-in to see the address settle
-    let b = tp.settle != null ? tp.settle + .5 : tp.t + 10;
-    b = Math.min(dur, Math.max(b, tp.t + 2.8), tp.t + 10, next ? next.addr - 1 : Infinity);
-    if (b - a > 1.5) { wins.push({ t0: a, t1: b, tTop: tp.t }); prevEnd = b; }
+    const next = tops[n + 1], k = tp.k;
+    const a = Math.max(prevEnd, Math.min(tp.t - 2.2 * k, tp.addr - 1.0 * Math.min(k, 3)), tp.t - 10 * k, 0);   // enough lead-in to see the address settle
+    let b = tp.settle != null ? tp.settle + .5 * k : tp.t + 10 * k;
+    b = Math.min(dur, Math.max(b, tp.t + 2.8 * k), tp.t + 10 * k, next ? next.addr - 1 : Infinity);
+    if (b - a > 1.5) { wins.push({ t0: a, t1: b, tTop: tp.t, k }); prevEnd = b; }
   });
   return wins;
 }
@@ -2901,7 +2936,7 @@ const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const DPR = Math.min(2.5, window.devicePixelRatio || 1);
 // Shown in settings and at the foot of the home screen, so it's always clear which build the phone is running
-const BUILD = 'Version 8, October 29', SW_VER = 'lagline-v8';
+const BUILD = 'Version 9, October 30', SW_VER = 'lagline-v9';
 // A Home Screen app can sit in memory for days. When it comes back to the front, check (with a 1 KB request) whether
 // a newer version has been uploaded, and offer to load it.
 let updAt = 0;
@@ -3760,6 +3795,244 @@ function solveClubNet(track, an, T) {
   const i1 = Math.min(P[0], n - 1), head0 = pA ? { x: pA[0], y: pA[1] } : { x: out[i1].hx, y: out[i1].hy };
   return { frames: out, head0, quality: good / n, net: true };
 }
+/* ---------- the club, followed through the swing (EdgeTAM: Meta's small video "segment anything" model) ----------
+   Given the club at address, it follows that one object frame by frame, keeping a memory of what it looked like, so it
+   holds on through blur and while the shaft points at the camera. Four ONNX graphs run in the browser; the memory bank
+   (which earlier frames the current one is compared against) is kept here, as in the reference implementation. */
+const TAM_FILES = ['vision_encoder', 'mask_decoder', 'memory_attention', 'memory_encoder'];
+let tamP = null;
+function tamNet() {
+  if (!tamP) tamP = (async () => {
+    if (!window.ort) await loadScript(ORT_CDN + 'ort.webgpu.min.js');
+    const ort = window.ort; ort.env.wasm.wasmPaths = ORT_CDN; ort.env.wasm.numThreads = (self.crossOriginIsolated ? 2 : 1);
+    const X0 = await (await fetch('tam_extra.json', { cache: 'force-cache' })).json(), X = {}; for (const k in X0) X[k] = Float32Array.from(X0[k]);
+    const bufs = await Promise.all(TAM_FILES.map(f => fetch('tam_' + f + '.onnx', { cache: 'force-cache' }).then(r => { if (!r.ok) throw new Error('no tam'); return r.arrayBuffer(); })));
+    let sess = null, ep = null;
+    for (const e of (navigator.gpu ? ['webgpu', 'wasm'] : ['wasm'])) {
+      try { sess = []; for (const b of bufs) sess.push(await ort.InferenceSession.create(b, { executionProviders: [e] })); ep = e; break; } catch (err) { sess = null; }
+    }
+    if (!sess) throw new Error('no tam');
+    const cv = document.createElement('canvas'); cv.width = cv.height = 1024;
+    return { ort, ep, VE: sess[0], MD: sess[1], MA: sess[2], ME: sess[3], X, cv, cx: cv.getContext('2d', { willReadFrequently: true }), px: new Float32Array(3 * 1024 * 1024) };
+  })().catch(e => { tamP = null; throw e; });
+  return tamP;
+}
+// follow the club through frames[i0..i1]; crop = {x0, y0, s} in frame pixels (a square); clicks in frame pixels
+async function tamTrack(net, frames, i0, i1, crop, clicks, step, onFrame, refIdx) {
+  const { ort, VE, MD, MA, ME, X, cx, px } = net, T = (d, a, sh) => new ort.Tensor(d, a, sh);
+  const NOMEM = X.no_memory_embedding, TPE = X.memory_temporal_positional_encoding, NUM = 7, MAXP = 16, A = 1024 * 1024;
+  const cond = {}, non = {}, out = {};
+  const toFlat = (d, C) => { const o = new Float32Array(4096 * C); for (let c = 0; c < C; c++) for (let i = 0; i < 4096; i++) o[i * C + c] = d[c * 4096 + i]; return o; };   // (1,C,64,64) -> (4096,1,C)
+  // reference frames (the address and the top): a mask pixel that looks just the same in this frame and in all of
+  // them is not the club (the club always moves): the ball, a tee, a caption or logo, a planted foot.
+  const refs = [];
+  for (const r of refIdx || []) { const im = await frames(r); cx.fillStyle = '#7f7f7f'; cx.fillRect(0, 0, 1024, 1024); cx.drawImage(im, crop.x0, crop.y0, crop.s, crop.s, 0, 0, 1024, 1024); refs.push(cx.getImageData(0, 0, 1024, 1024).data.slice()); }
+  const still = (d, q) => refs.length > 0 && refs.every(R => Math.abs(d[q] - R[q]) + Math.abs(d[q + 1] - R[q + 1]) + Math.abs(d[q + 2] - R[q + 2]) < 30);
+  let k = 0;
+  for (let fi = i0; fi <= i1; fi += step, k++) {
+    if (cancelProc) throw new Error('cancel');
+    const im = await frames(fi);
+    cx.fillStyle = '#7f7f7f'; cx.fillRect(0, 0, 1024, 1024); cx.drawImage(im, crop.x0, crop.y0, crop.s, crop.s, 0, 0, 1024, 1024);
+    const d = cx.getImageData(0, 0, 1024, 1024).data;
+    for (let i = 0, j = 0; i < A; i++, j += 4) { px[i] = (d[j] / 255 - .485) / .229; px[i + A] = (d[j + 1] / 255 - .456) / .224; px[i + 2 * A] = (d[j + 2] / 255 - .406) / .225; }
+    const e = await VE.run({ pixel_values: T('float32', px, [1, 3, 1024, 1024]) });
+    const f2 = e.feats2.data, p2 = e.pos2.data;
+    let feats2;
+    if (k === 0) { const c = new Float32Array(f2.length); for (let ch = 0; ch < 256; ch++) for (let i = 0; i < 4096; i++) c[ch * 4096 + i] = f2[ch * 4096 + i] + NOMEM[ch]; feats2 = c; }
+    else {
+      const blocks = [[0, cond[0]]]; for (let r = NUM - 1; r >= 1; r--) if (non[k - r]) blocks.push([r, non[k - r]]);
+      const n = blocks.length * 512, mem = new Float32Array(n * 64), mpos = new Float32Array(n * 64);
+      blocks.forEach(([off, rec], b) => { const t = TPE.subarray(((off - 1 + 7) % 7) * 64, ((off - 1 + 7) % 7) * 64 + 64); mem.set(rec.mem, b * 512 * 64);
+        for (let i = 0; i < 512; i++) for (let c = 0; c < 64; c++) mpos[(b * 512 + i) * 64 + c] = rec.pos[i * 64 + c] + t[c]; });
+      const ptrs = [cond[0].ptr]; for (let r = 1; r < Math.min(k + 1, MAXP); r++) if (non[k - r]) ptrs.push(non[k - r].ptr);
+      const pm = new Float32Array(ptrs.length * 256); ptrs.forEach((p, i) => pm.set(p, i * 256));
+      const o = await MA.run({ current_vision_features: T('float32', toFlat(f2, 256), [4096, 1, 256]), current_vision_position_embeddings: T('float32', toFlat(p2, 256), [4096, 1, 256]),
+        spatial_memory: T('float32', mem, [n, 1, 64]), spatial_memory_position_embeddings: T('float32', mpos, [n, 1, 64]),
+        pointer_memory: T('float32', pm, [ptrs.length * 4, 1, 64]), pointer_memory_position_embeddings: T('float32', new Float32Array(ptrs.length * 256), [ptrs.length * 4, 1, 64]) });
+      const cfl = o.conditioned_features.data, c = new Float32Array(256 * 4096); for (let i = 0; i < 4096; i++) for (let ch = 0; ch < 256; ch++) c[ch * 4096 + i] = cfl[i * 256 + ch]; feats2 = c;
+      try { o.conditioned_features.dispose(); } catch (err) { /* already gone */ }
+    }
+    const P = k === 0 ? clicks.map(q => [(q[0] - crop.x0) / crop.s * 1024, (q[1] - crop.y0) / crop.s * 1024]) : [[0, 0]], Lb = k === 0 ? clicks.map(q => q[2]) : [-1];
+    const dec = await MD.run({ feats0: e.feats0, feats1: e.feats1, feats2: T('float32', feats2, [1, 256, 64, 64]), input_points: T('float32', Float32Array.from(P.flat()), [1, 1, P.length, 2]), input_labels: T('int32', Int32Array.from(Lb), [1, 1, Lb.length]) });
+    const hr = dec.high_res_masks, score = dec.object_score_logits.data[0];
+    const me = await ME.run({ vision_features: T('float32', f2, [1, 256, 64, 64]), pred_masks_high_res: hr, is_mask_from_pts: T('bool', Uint8Array.from([k === 0 ? 1 : 0]), [1]) });
+    const rec = { mem: me.memory_tokens.data.slice(), pos: me.memory_pos_enc.data.slice(), ptr: dec.object_pointer.data.slice() };
+    const m = hr.data.slice();
+    // free the frame's tensors now (the runtime holds them in its own memory otherwise, and a swing has hundreds)
+    for (const r of [e, dec, me]) for (const t of Object.values(r)) try { t.dispose(); } catch (err) { /* already gone */ }
+    if (k === 0) cond[0] = rec; else { non[k] = rec; delete non[k - MAXP]; }
+    // the mask, as frame-pixel points (every other pixel)
+    const xs = [], ys = [];
+    for (let y = 0; y < 1024; y += 2) for (let x = 0; x < 1024; x += 2) if (m[y * 1024 + x] > 0 && !still(d, (y * 1024 + x) * 4)) { xs.push(crop.x0 + x / 1024 * crop.s); ys.push(crop.y0 + y / 1024 * crop.s); }
+    out[fi] = { xs, ys, score, cell: 2 * crop.s / 1024 };
+    if (onFrame) onFrame(k);
+  }
+  return out;
+}
+// the clubhead in each tracked frame: the end of the club mask away from the hands
+function tamHeads(masks, grip, L0, start) {
+  // the far end of a set of mask points from the hands (along the mask's long axis)
+  const farEnd = (xs, ys, g) => {
+    const n = xs.length; if (n < 4) return null;
+    let mx = 0, my = 0; for (let i = 0; i < n; i++) { mx += xs[i]; my += ys[i]; } mx /= n; my /= n;
+    let a = 0, b = 0, c = 0; for (let i = 0; i < n; i++) { const dx = xs[i] - mx, dy = ys[i] - my; a += dx * dx; b += dx * dy; c += dy * dy; }
+    const th = .5 * Math.atan2(2 * b, a - c), ux = Math.cos(th), uy = Math.sin(th);
+    const pr = []; for (let i = 0; i < n; i++) pr.push([(xs[i] - mx) * ux + (ys[i] - my) * uy, i]); pr.sort((p, q) => p[0] - q[0]);
+    const lo = pr[Math.floor(n * .02)][1], hi = pr[Math.min(n - 1, Math.floor(n * .98))][1];
+    const e1 = [xs[lo], ys[lo]], e2 = [xs[hi], ys[hi]], len = Math.hypot(e2[0] - e1[0], e2[1] - e1[1]);
+    const far = Math.hypot(e1[0] - g.x, e1[1] - g.y) > Math.hypot(e2[0] - g.x, e2[1] - g.y) ? e1 : e2;
+    return { x: far[0], y: far[1], len, short: L0 && len < .3 * L0 };
+  };
+  const o = {};
+  for (const f of Object.keys(masks).map(Number).sort((p, q) => p - q)) {
+    const g = grip(f), score = masks[f].score;
+    if (score < 0) { o[f] = null; continue; }
+    // the club can't reach farther from the hands than its own length: drop anything beyond (a caption, a logo,
+    // a second club in the bag, a person walking past)
+    let xs = masks[f].xs, ys = masks[f].ys;
+    if (L0) { const kx = [], ky = []; for (let i = 0; i < xs.length; i++) if (Math.hypot(xs[i] - g.x, ys[i] - g.y) <= 1.3 * L0) { kx.push(xs[i]); ky.push(ys[i]); } xs = kx; ys = ky; }
+    const whole = farEnd(xs, ys, g);
+    // the club is one piece held in the hands: the part of the mask joined to the hands (gaps of up to ~12% of the
+    // club allowed, a fast shaft blurs and breaks up). A piece off on its own (the mat the head sat on, a shadow)
+    // is not the club; but a blurred shaft can also break up more than that, so both readings are kept.
+    let joined = null; const cell = masks[f].cell;
+    if (cell && L0 && xs.length) {
+      const key = (x, y) => Math.round(x / cell) + ',' + Math.round(y / cell), grid = new Map();
+      for (let i = 0; i < xs.length; i++) { const kk = key(xs[i], ys[i]); if (!grid.has(kk)) grid.set(kk, []); grid.get(kk).push(i); }
+      let seed = []; for (const r of [.2, .35, .5]) { seed = []; for (let i = 0; i < xs.length; i++) if (Math.hypot(xs[i] - g.x, ys[i] - g.y) < r * L0) seed.push(i); if (seed.length) break; }
+      if (seed.length) {
+        const keep = new Set(), q = []; for (const i of seed) { const kk = key(xs[i], ys[i]); if (!keep.has(kk)) { keep.add(kk); q.push(kk); } }
+        const R = Math.max(3, Math.round(.12 * L0 / cell));
+        while (q.length) { const [cx0, cy0] = q.pop().split(',').map(Number);
+          for (let dx = -R; dx <= R; dx++) for (let dy = -R; dy <= R; dy++) { const kk = (cx0 + dx) + ',' + (cy0 + dy); if (!keep.has(kk) && grid.has(kk)) { keep.add(kk); q.push(kk); } } }
+        const kx = [], ky = []; for (const kk of keep) for (const i of grid.get(kk) || []) { kx.push(xs[i]); ky.push(ys[i]); }
+        if (kx.length < xs.length) joined = farEnd(kx, ky, g);
+      }
+    }
+    // the joined part pointing the same way as the whole mask but shorter: the shaft just broke up in the blur, so
+    // the whole mask's end is the head; pointing another way: the rest is something else, keep the joined part
+    let pick = whole;
+    if (joined && whole) {
+      let d = Math.atan2(whole.y - g.y, whole.x - g.x) - Math.atan2(joined.y - g.y, joined.x - g.x); while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI;
+      const sameWay = Math.abs(d) < 12 * Math.PI / 180 && Math.hypot(whole.x - g.x, whole.y - g.y) >= Math.hypot(joined.x - g.x, joined.y - g.y);
+      pick = sameWay ? whole : joined;
+    } else if (joined) pick = joined;
+    o[f] = pick;
+  }
+  return o;
+}
+async function refineClubTAM(it, onFrame) {
+  const tr = it.raw.clubTrack, an = it.an, n = it.raw.times.length, c0 = it.raw.club0; let P = an.P;
+  if (!tr || !c0 || !it.frames || it.frames.length !== n) return false;
+  const net = await tamNet();
+  const i1 = Math.min(P[0], n - 1), gr = i => (tr[i] ? { x: tr[i].gx, y: tr[i].gy } : null);
+  const g1 = gr(i1); if (!g1) return false;
+  // the picture is stored smaller than the video: work in its pixels
+  const bmp0 = await createImageBitmap(it.frames[0]), k = bmp0.width / it.raw.w;
+  const f1 = it.raw.lm[i1], L = Math.hypot((f1[11].x + f1[12].x - f1[23].x - f1[24].x) / 2, (f1[11].y + f1[12].y - f1[23].y - f1[24].y) / 2) || 100;
+  const sc = { x: (f1[11].x + f1[12].x) / 2, y: (f1[11].y + f1[12].y) / 2 }, half = 2.7 * L;
+  const crop = { x0: (sc.x - half) * k, y0: (sc.y - half * .85) * k, s: 2 * half * k };
+  const pix = async i => { const b = await createImageBitmap(it.frames[i]), c = document.createElement('canvas'); c.width = b.width; c.height = b.height; const g = c.getContext('2d', { willReadFrequently: true }); g.drawImage(b, 0, 0); return g.getImageData(0, 0, b.width, b.height); };
+  const A0 = await pix(i1), lumAt = (x, y) => { x = Math.round(x); y = Math.round(y); if (x < 0 || y < 0 || x >= A0.width || y >= A0.height) return null; const q = (y * A0.width + x) * 4; return (A0.data[q] + A0.data[q + 1] + A0.data[q + 2]) / 3; };
+  // The clubhead to start from: the detector's, when it sees one there (the address estimate can be off, e.g. on a
+  // clip that starts once the takeaway has begun), else the address estimate.
+  let hd = { x: c0.x, y: c0.y };
+  const dh = tr[i1] && tr[i1].det && tr[i1].det.heads && tr[i1].det.heads[0];
+  if (dh && dh.s > .15) { const lg = Math.hypot(dh.x - g1.x, dh.y - g1.y); if (lg > 1.2 * L && Math.hypot(dh.x - c0.x, dh.y - c0.y) > .15 * lg) hd = { x: dh.x, y: dh.y }; }
+  const at = t => [(g1.x + (hd.x - g1.x) * t) * k, (g1.y + (hd.y - g1.y) * t) * k];
+  // A point on the shaft: the hands-to-head line misses a thin shaft by a few pixels (shafts flex, the hands' point
+  // is not exactly the grip), so look across the line for the thin bright or dark stripe the shaft makes.
+  const Ls = Math.hypot(hd.x - g1.x, hd.y - g1.y) * k, nx = -(hd.y - g1.y) * k / (Ls || 1), ny = (hd.x - g1.x) * k / (Ls || 1);
+  const snap = t => { const [px, py] = at(t); let best = null, bv = 12;
+    for (let o = -14; o <= 14; o++) { const c = lumAt(px + o * nx, py + o * ny), l = lumAt(px + (o - 3) * nx, py + (o - 3) * ny), r = lumAt(px + (o + 3) * nx, py + (o + 3) * ny);
+      if (c == null || l == null || r == null) continue; const v = Math.abs(c - (l + r) / 2); if (v > bv) { bv = v; best = [px + o * nx, py + o * ny]; } }
+    return best || [px, py]; };
+  // Seeds: the clubhead, two points on the shaft; "not this" just past the head and on the hips.
+  const clicks = [[hd.x * k, hd.y * k, 1], [...snap(.55), 1], [...snap(.8), 1], [...at(1.15), 0], [(f1[23].x + f1[24].x) / 2 * k, (f1[23].y + f1[24].y) / 2 * k, 0]];
+  const iEnd = n - 1, total = iEnd - i1 + 1, step = net.ep === 'webgpu' ? Math.max(1, Math.ceil(total / 180)) : Math.max(1, Math.ceil(total / 70));
+  const cache = new Map(); const frames = async i => { if (!cache.has(i)) { cache.clear(); cache.set(i, await createImageBitmap(it.frames[i])); } return cache.get(i); };
+  const L0 = Ls;
+  // The ball touches the clubhead at address, so the first mask often takes it in, and the "far end of the club"
+  // is then the ball for the whole backswing. Find it: the part of the address mask near the head that looks just
+  // the same once the club has gone (frame P3), i.e. something that did not move. Mark it "not this".
+  let ball = null;
+  try {
+    const m0 = (await tamTrack(net, frames, i1, i1, crop, clicks, 1, null))[i1];
+    const iMv = Math.min(n - 1, Math.max(i1 + 3, P[2])), A1 = await pix(iMv), hx0 = hd.x * k, hy0 = hd.y * k, st = [];
+    for (let j = 0; j < m0.xs.length; j++) {
+      const x = Math.round(m0.xs[j]), y = Math.round(m0.ys[j]); if (x < 0 || y < 0 || x >= A0.width || y >= A0.height) continue;
+      if (Math.hypot(x - hx0, y - hy0) > .35 * L0) continue;
+      const q = (y * A0.width + x) * 4, df = Math.abs(A0.data[q] - A1.data[q]) + Math.abs(A0.data[q + 1] - A1.data[q + 1]) + Math.abs(A0.data[q + 2] - A1.data[q + 2]);
+      const r = A0.data[q], g = A0.data[q + 1], bl = A0.data[q + 2];
+      if (df < 36 && (r + g + bl) / 3 > 150 && Math.max(r, g, bl) - Math.min(r, g, bl) < 70) st.push([x, y]);   // still AND ball-white (grass the mask spilled onto is still too)
+    }
+    // An air swing (or a mat, or grass the mask spilled onto) has no ball: only call it a ball if the still part is
+    // ball-sized for this club (a ball is ~4% of a club's length), compact, and bright. Otherwise no ball at all.
+    if (st.length >= 5) {
+      const med = a => a.slice().sort((p, q) => p - q)[a.length >> 1];
+      const bx = med(st.map(p => p[0])), by = med(st.map(p => p[1]));
+      const near = st.filter(p => Math.hypot(p[0] - bx, p[1] - by) < .08 * L0);
+      let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9, lum = 0, sat = 0;
+      for (const [x, y] of near) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+        const q = (y * A0.width + x) * 4, r = A0.data[q], g = A0.data[q + 1], b = A0.data[q + 2]; lum += (r + g + b) / 3; sat += Math.max(r, g, b) - Math.min(r, g, b); }
+      const w = x1 - x0 + 2, h = y1 - y0 + 2, sz = Math.max(w, h); lum /= Math.max(1, near.length); sat /= Math.max(1, near.length);
+      const ballLike = near.length >= 5 && near.length >= .6 * st.length && sz > .015 * L0 && sz < .12 * L0 && Math.min(w, h) / sz > .35 && lum > 150 && sat < 70;
+      if (ballLike) { ball = { x: bx, y: by, r: Math.max(4, .7 * sz) }; clicks.push([bx, by, 0]); }
+    }
+  } catch (e) { ball = null; }
+  const masks = await tamTrack(net, frames, i1, iEnd, crop, clicks, step, j => onFrame && onFrame(j, Math.ceil(total / step)), [i1, Math.min(n - 1, P[3])]);
+  // and never read the ball (or the tee it leaves) as the clubhead, through impact and just after it
+  if (ball) for (const f in masks) { if (+f > P[8]) continue; const m = masks[f], xs = [], ys = []; for (let j = 0; j < m.xs.length; j++) if (Math.hypot(m.xs[j] - ball.x, m.ys[j] - ball.y) > ball.r) { xs.push(m.xs[j]); ys.push(m.ys[j]); } m.xs = xs; m.ys = ys; }
+  it.tamBall = ball; it.tamSeed = clicks;
+  const H = tamHeads(masks, i => { const g = gr(i) || g1; return { x: g.x * k, y: g.y * k }; }, L0, { x: hd.x * k, y: hd.y * k });
+  // every frame: tracked ones as found, the ones skipped (or lost) eased between their neighbours
+  const keys = Object.keys(H).map(Number).filter(i => H[i]).sort((a, b) => a - b); if (keys.length < 6) return false;
+  const hx = new Array(n).fill(null), hy = new Array(n).fill(null), w = new Array(n).fill(0);
+  for (const i of keys) { hx[i] = H[i].x / k; hy[i] = H[i].y / k; w[i] = H[i].short ? .3 : 1; }
+  hx[i1] = hd.x; hy[i1] = hd.y; w[i1] = 4;
+  const lam = hx.map(() => .02);
+  let sx = whittaker(hx, w, lam, 2, 4), sy = whittaker(hy, w, lam, 2, 4);
+  // Impact, from the club: the clubhead bottoms out at the ball. Where the hands come back to (the pose-only guess)
+  // runs early on slowed clips. Look between lead-arm-parallel-down and the trail arm being up; the swing positions
+  // are worked out again around it.
+  { const a = Math.max(i1 + 1, P[4]), b = Math.min(n - 2, P[8]); let im = -1;
+    let ym = -Infinity; for (let i = a; i <= b; i++) if (sy[i] != null) ym = Math.max(ym, sy[i]);
+    // the first time it reaches the bottom of its arc (a later low reading can be a stray one on the ground)
+    for (let i = a; i <= b; i++) if (sy[i] != null && sy[i] >= ym - .06 * L0 / k) { im = i; while (im < b && sy[im + 1] != null && sy[im + 1] > sy[im]) im++; break; }
+    if (im > 0 && im !== P[6]) { it.raw.impAt = im; analyzeItem(it); P = it.an.P; } }
+  // The follow-through mirrors the downswing: from impact to shaft-parallel-through the club sweeps out the angles
+  // it swept from shaft-parallel-down to impact, reflected about the impact angle (and on to the trail arm being
+  // up, as lead-arm-parallel-down to shaft-parallel-down). The downswing is where the tracker is surest, so it
+  // sets a strong prior here: a reading that agrees with it counts with it, one that is missing or far off gives
+  // way to it. (Tested: as a light prior it fills gaps and overrides gross misses; made strong it hurts, since
+  // seen down the line the club exits on a steeper plane than it came in on, so the mirror is only approximate.)
+  const ang = i => Math.atan2(sy[i] - (gr(i) || g1).y, sx[i] - (gr(i) || g1).x), len = i => Math.hypot(sx[i] - (gr(i) || g1).x, sy[i] - (gr(i) || g1).y);
+  const P4 = P[4], P5 = P[5], P6 = P[6], P7 = P[7], P8 = Math.min(n - 1, P[8]), Lh = L0 / k;
+  let mirrored = 0;
+  if (P4 >= i1 && P4 < P5 && P5 < P6 && P6 < P7 && P7 < P8) {
+    const a6 = ang(P6), wrap = d => { while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; };
+    const at2 = (fn, x) => { const j = Math.floor(x), f = x - j; return j + 1 > n - 1 ? fn(j) : fn(j) * (1 - f) + fn(j + 1) * f; };
+    const angAt = x => { const j = Math.floor(x), f = x - j; return ang(j) + f * wrap(ang(Math.min(n - 1, j + 1)) - ang(j)); };
+    const px = hx.slice(), py = hy.slice(), pw = w.slice();
+    for (let i = P6 + 1; i <= P8; i++) {
+      const j = i <= P7 ? P6 - (i - P6) / (P7 - P6) * (P6 - P5) : P5 - (i - P7) / (P8 - P7) * (P5 - P4);
+      const th = a6 - wrap(angAt(j) - a6), ln = at2(len, j), g = gr(i) || g1;
+      const qx = g.x + ln * Math.cos(th), qy = g.y + ln * Math.sin(th), wp = .1;
+      if (w[i] > 0 && hx[i] != null) {
+        const wm = Math.hypot(hx[i] - qx, hy[i] - qy) < .6 * Lh ? w[i] : .2 * w[i];
+        px[i] = (wm * hx[i] + wp * qx) / (wm + wp); py[i] = (wm * hy[i] + wp * qy) / (wm + wp); pw[i] = wm + wp;
+      } else { px[i] = qx; py[i] = qy; pw[i] = wp; }
+      mirrored++;
+    }
+    sx = whittaker(px, pw, lam, 2, 4); sy = whittaker(py, pw, lam, 2, 4);
+  }
+  it.tamMirror = mirrored;
+  const frames2 = [];
+  for (let i = 0; i < n; i++) { const g = gr(i) || g1; frames2.push(i < i1 ? { gx: g.x, gy: g.y, hx: hd.x, hy: hd.y, est: true } : { gx: g.x, gy: g.y, hx: sx[i], hy: sy[i], est: !H[i] || H[i].short }); }
+  const last = Math.max(keys[keys.length - 1], mirrored ? Math.min(n - 1, P[8]) : 0); for (let i = last + 1; i < n; i++) frames2[i] = null;
+  it.raw.club = frames2; it.clubQ = keys.length / Math.ceil(total / step); it.clubBy = 'tam';
+  analyzeItem(it); return true;
+}
 // Pass 1: a quick look at the whole clip, about 6 frames a second, just to find where the swings are.
 async function scanClip(v, pose, w, h, dur) {
   pose.reset();
@@ -3840,6 +4113,11 @@ function makeSwing(tr, w, h, base, strict) {
   if (it.an.bsTime > 1.8) it.timeScale = it.an.bsTime / .85;
   return it;
 }
+// follow the club with EdgeTAM once the swing is known (keeps the detector's path if the model can't load or loses it)
+async function tamFor(it, k, n) {
+  try { await refineClubTAM(it, (j, m) => busy(n > 1 ? `Tracing the club, swing ${k + 1} of ${n}` : 'Tracing the club', `Frame ${j + 1} of ${m}`, .3 + .7 * (k + (j + 1) / m) / n, cancelAct())); }
+  catch (e) { if (e && e.message === 'cancel') throw e; console.warn('club tracking fell back:', e && e.message); }
+}
 async function processFile(file) {
   if (!file) return;
   cancelProc = false; FRAME_DUR = 0;
@@ -3870,16 +4148,16 @@ async function processFile(file) {
         if (dur > 5) tlDraw(1, wins, dur, k);
       });
       const it = makeSwing(tr, w, h, base, wins.length > 1 || dur > 5);
-      if (it) items.push(it); else tracked.push(tr);
+      if (it) { await tamFor(it, k, n); items.push(it); } else tracked.push(tr);
     }
     // 3. the strict check (tempo in a golf range) turned every window down: take the best of what's already tracked
     //    rather than tracking the clip again
-    if (!items.length && tracked.length) for (const tr of tracked) { const it = makeSwing(tr, w, h, base, false); if (it) { items.push(it); break; } }
+    if (!items.length && tracked.length) for (const tr of tracked) { const it = makeSwing(tr, w, h, base, false); if (it) { await tamFor(it, 0, 1); items.push(it); break; } }
     // 4. no swing-shaped window at all in a shortish clip: track it whole, the way a single-swing clip is handled
     if (!items.length && !wins.length && dur > 5 && dur <= 25) {
       const tr = await trackWindow(v, pose, w, h, { t0: 0, t1: dur }, FRAME_MAX, (j, m) => busy('Tracking your swing', `Frame ${j + 1} of ${m}`, (j + 1) / m, cancelAct()));
       if (tr.found < tr.times.length * .5) throw new Error('Couldn’t find a golfer in most frames. Keep your whole body and club in the shot, with even light.');
-      const it = makeSwing(tr, w, h, base, false); if (it) items.push(it);
+      const it = makeSwing(tr, w, h, base, false); if (it) { await tamFor(it, 0, 1); items.push(it); }
     }
     if (!items.length) throw new Error(NO_SWING);
     releaseVideo(v, url); unbusy();
@@ -5398,7 +5676,7 @@ function init() {
     if (S.tab === 'an') { tickPlayback(dt); if (S.dirty) { S.dirty = false; drawAnalysis(); } }
   };
   requestAnimationFrame(loop);
-  window.__lagline = { perf: () => ({ cost, lod }), clubInFrame, solveClub, solveClubNet, clubDetect, clubNet, whittaker, openItem, trackWindow, makeSwing, getPose, findShaft, grayBox, gripOf, finishClip, analyzeItem, toJpeg, S, openDemo, processFile, LG, drawGolfer, rangeBg, PAL, openCoach, openDrill, openLive, openTempo, LIVE, COACH };
+  window.__lagline = { perf: () => ({ cost, lod }), clubInFrame, solveClub, solveClubNet, tamNet, tamTrack, refineClubTAM, clubDetect, clubNet, whittaker, openItem, trackWindow, makeSwing, getPose, findShaft, grayBox, gripOf, finishClip, analyzeItem, toJpeg, S, openDemo, processFile, LG, drawGolfer, rangeBg, PAL, openCoach, openDrill, openLive, openTempo, LIVE, COACH };
 }
 init();
 })();
