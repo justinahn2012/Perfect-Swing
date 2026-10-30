@@ -1525,6 +1525,32 @@ const median = a => { const s = a.slice().sort((x, y) => x - y); return s.length
    much better. Then a zero-phase clean-up: a short median kills one-frame spikes, and a Savitzky–Golay fit smooths
    without lagging or flattening fast motion. Torso and legs move slowly and get a longer window than arms and hands. */
 const SWAP_GROUPS = [[[11, 12]], [[23, 24]], [[13, 14], [15, 16], [17, 18], [19, 20], [21, 22]], [[25, 26], [27, 28], [29, 30], [31, 32]]];
+// Both hands are on the grip for the whole swing, so the two wrists can never be further apart than two hands on a
+// club. The pose model places each wrist on its own, and a hidden or blurred hand drifts off on its own (onto the
+// hip, the head, the other arm). Wherever they are too far apart, pull both onto the grip, the less certain hand
+// moving the most, so a hidden hand follows the seen one. Fingers move with their wrist. Hands seen clearly apart
+// for a run of frames (the trail hand let go at the finish, or no club at all) are left as they are.
+function joinHands(lm, wl, L) {
+  const n = lm.length, MAX2 = .25 * L, MAX3 = .15, LH = [15, 17, 19, 21], RH = [16, 18, 20, 22];
+  const vv = p => Math.max(.05, Math.min(1, p.v == null ? 1 : p.v));
+  const apart = lm.map(f => f && vv(f[15]) > .85 && vv(f[16]) > .85 && d2(f[15], f[16]) > .45 * L);
+  const keep = new Array(n).fill(false);
+  for (let i = 0; i < n;) { let j = i; while (j < n && apart[j]) j++; if (j - i >= 5) for (let k = i; k < j; k++) keep[k] = true; i = Math.max(j, i + 1); }
+  const pull = (f, max, vl, vr, is3) => {
+    const a = f[15], b = f[16], sep = is3 ? Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) : d2(a, b); if (!(sep > max)) return f;
+    const s = max / sep, m = { x: (vl * a.x + vr * b.x) / (vl + vr), y: (vl * a.y + vr * b.y) / (vl + vr), z: (vl * (a.z || 0) + vr * (b.z || 0)) / (vl + vr) };
+    const to = p => ({ x: m.x + (p.x - m.x) * s, y: m.y + (p.y - m.y) * s, z: m.z + ((p.z || 0) - m.z) * s });
+    const da = to(a), db = to(b), g = f.slice();
+    const shift = (js, w, d) => { for (const j of js) g[j] = Object.assign({}, f[j], { x: f[j].x + d.x - w.x, y: f[j].y + d.y - w.y }, f[j].z != null ? { z: f[j].z + d.z - (w.z || 0) } : {}); };
+    shift(LH, a, da); shift(RH, b, db); return g;
+  };
+  for (let i = 0; i < n; i++) {
+    if (!lm[i] || keep[i]) continue;
+    const vl = vv(lm[i][15]), vr = vv(lm[i][16]);
+    lm[i] = pull(lm[i], MAX2, vl, vr, false);
+    if (wl && wl[i]) wl[i] = pull(wl[i], MAX3, vl, vr, true);
+  }
+}
 function fixSwaps(lm, wl, L) {
   // judged in 3D (world landmarks): from down the line the pair overlaps on screen but sits ~20 cm apart in depth
   const d3 = (p, q) => Math.hypot(p.x - q.x, p.y - q.y, (p.z || 0) - (q.z || 0));
@@ -1543,20 +1569,55 @@ function fixSwaps(lm, wl, L) {
   }
 }
 const SLOW = new Set([11, 12, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-function cleanFrames(frames) {
+// Smooth each body point over time. The window is set in seconds, not frames, so a 240 fps Slo-mo is smoothed as
+// much as a 30 fps clip (a fixed few frames did almost nothing at high frame rates). It is a robust Whittaker
+// smoother: zero lag, each reading weighted by how sure the pose model was of it, and a reading far off the curve
+// (a one-frame jump, an arm grabbed onto the torso) loses its weight on the next pass. The trunk, legs and head move
+// slowly and get more smoothing; the arms and hands move fast through the downswing and get less, so impact
+// positions are not rounded off.
+const SMOOTH_T = { slow: .06, arm: .03, hand: .022 };
+function cleanFrames(frames, times, vis, floor, handFloor) {
   const n = frames.length; if (n < 7) return frames;
-  const med = (arr, i, r, c) => { const v = []; for (let k = -r; k <= r; k++) v.push(arr[Math.min(n - 1, Math.max(0, i + k))][c]); v.sort((x, y) => x - y); return v[r]; };
-  const SG5 = [-3, 12, 17, 12, -3].map(x => x / 35), SG9 = [-21, 14, 39, 54, 59, 54, 39, 14, -21].map(x => x / 231);
+  const dts = []; for (let i = 1; i < n; i++) if (times && times[i] > times[i - 1]) dts.push(times[i] - times[i - 1]);
+  dts.sort((a, b) => a - b); const dt = dts.length ? dts[dts.length >> 1] : 1 / 30;
   const out = frames.map(f => f.map(p => Object.assign({}, p)));
   for (let j = 0; j < 33; j++) {
-    const slow = SLOW.has(j), mr = slow ? 2 : 1, K = slow ? SG9 : SG5, r = (K.length - 1) / 2;
+    const tau = SLOW.has(j) ? SMOOTH_T.slow : j >= 15 ? SMOOTH_T.hand : SMOOTH_T.arm, lam = (tau / dt) ** 4;
+    const w0 = frames.map((f, i) => { const v = (vis ? vis[i][j].v : f[j].v); return Math.max(.05, Math.min(1, v == null ? 1 : v)); });
+    const L = new Array(n).fill(lam);
     for (const c of ['x', 'y', 'z']) {
       if (frames[0][j][c] == null) continue;
-      const col = frames.map(f => ({ [c]: f[j][c] })), m = col.map((_, i) => med(col, i, mr, c));
-      for (let i = 0; i < n; i++) { let s = 0; for (let k = -r; k <= r; k++) s += K[k + r] * m[Math.min(n - 1, Math.max(0, i + k))]; out[i][j][c] = s; }
+      // (for the arms and hands a reading only counts as bad when it is far off, about half a torso: through impact
+      // the hands move further in a frame than in a second at address, and a tight test would flatten the strike)
+      const sm = robustSmooth(frames.map(f => f[j][c]), w0, L, 3, SLOW.has(j) ? floor || 0 : Math.max(floor || 0, handFloor || 0));
+      for (let i = 0; i < n; i++) out[i][j][c] = sm[i];
     }
   }
   return out;
+}
+function robustSmooth(y, w0, lam, iters, floor) {
+  const n = y.length; if (n < 3) return y.slice();
+  let w = w0.slice(); const x = new Float64Array(n);
+  for (let it = 0; it < iters; it++) {
+    const d0 = new Float64Array(n), d1 = new Float64Array(n), d2 = new Float64Array(n), b = new Float64Array(n);
+    for (let i = 0; i < n; i++) { d0[i] = w[i] + 1e-9; b[i] = w[i] * y[i]; }
+    for (let j = 0; j < n - 2; j++) { const l = lam[j]; d0[j] += l; d1[j] -= 2 * l; d2[j] += l; d0[j + 1] += 4 * l; d1[j + 1] -= 2 * l; d0[j + 2] += l; }
+    const D = new Float64Array(n), L1 = new Float64Array(n), L2 = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      const l2 = i >= 2 ? d2[i - 2] / D[i - 2] : 0, l1 = i >= 1 ? (d1[i - 1] - (i >= 2 ? l2 * L1[i - 1] * D[i - 2] : 0)) / D[i - 1] : 0;
+      L1[i] = l1; L2[i] = l2; D[i] = d0[i] - l1 * l1 * (i >= 1 ? D[i - 1] : 0) - l2 * l2 * (i >= 2 ? D[i - 2] : 0);
+    }
+    const z = new Float64Array(n);
+    for (let i = 0; i < n; i++) z[i] = b[i] - (i >= 1 ? L1[i] * z[i - 1] : 0) - (i >= 2 ? L2[i] * z[i - 2] : 0);
+    for (let i = 0; i < n; i++) z[i] /= D[i];
+    for (let i = n - 1; i >= 0; i--) x[i] = z[i] - (i + 1 < n ? L1[i + 1] * x[i + 1] : 0) - (i + 2 < n ? L2[i + 2] * x[i + 2] : 0);
+    if (it + 1 < iters) {
+      const r = []; for (let i = 0; i < n; i++) r.push(Math.abs(y[i] - x[i])); r.sort((p, q) => p - q);
+      const sc = Math.max(floor, 1.4826 * r[n >> 1]) * 4.685;
+      for (let i = 0; i < n; i++) { const u = (y[i] - x[i]) / (sc || 1); w[i] = Math.abs(u) >= 1 ? .02 * w0[i] : w0[i] * (1 - u * u) * (1 - u * u); }
+    }
+  }
+  return Array.from(x);
 }
 // Where the hands hold the club: wrists plus the index and little-finger points, weighted by how visible they are.
 function gripPt(f) {
@@ -1590,6 +1651,7 @@ function idxAt(times, t) {
 function argRange(arr, a, b, cmp) { let k = a; for (let i = a; i <= b; i++) if (cmp(arr[i], arr[k])) k = i; return k; }
 // Hand-height fractions that mark P2/P3/P5/P6 (of the address→top rise) and P8/P9 (of the impact→finish rise)
 const PF = { p2: .14, p3: .55, p5: .52, p6: .16, p8: .22, p9: .62 };
+let FIN_EXT = 1;   // see the finish, below
 function detectP(hands, times, L, view, impAt) {
   // (a median over 5 frames first: a one-frame jump in the pose, at a cut or a fade, is not a hand movement)
   const n = hands.length, y0_ = hands.map(p => p.y), y = y0_.map((_, i) => { const w = y0_.slice(Math.max(0, i - 2), Math.min(n, i + 3)).sort((a, b) => a - b); return w[w.length >> 1]; });
@@ -1599,7 +1661,11 @@ function detectP(hands, times, L, view, impAt) {
   // the fastest the hands come down, but only a drop that ends with the hands back down at the ball (a camera cut,
   // a fade or a jump in the pose at the end of the clip can be "fast" too)
   let yLowest = -Infinity; for (let i = 0; i < n; i++) yLowest = Math.max(yLowest, y[i]);
-  const reachesBall = i => { for (let j = i; j < n && times[j] - times[i] < 1.2 * Math.max(1, (times[n - 1] - times[0]) / 4); j++) if (y[j] > yLowest - .7 * L) return true; return false; };
+  // "Back down" is measured against how high the hands went: in a fast downswing the pose loses the blurred hands
+  // and puts them short of the ball, by more on a big swing.
+  const hiBefore = []; { let m = Infinity; for (let i = 0; i < n; i++) { m = Math.min(m, y[i]); hiBefore.push(m); } }
+  const reachesBall = i => { const tol = Math.max(.7 * L, Math.min(1.0 * L, .5 * (yLowest - hiBefore[i])));
+    for (let j = i; j < n && times[j] - times[i] < 1.2 * Math.max(1, (times[n - 1] - times[0]) / 4); j++) if (y[j] > yLowest - tol) return true; return false; };
   const teleport = i => Math.abs(y0_[Math.min(n - 1, i + 1)] - y0_[Math.max(0, i - 1)]) > .8 * L;   // a jump no hands make in a frame
   // and preferably one the hands climb back up from (the follow-through): a drop at the very end of a clip that is
   // only a fade or a cut has nothing after it
@@ -1632,6 +1698,12 @@ function detectP(hands, times, L, view, impAt) {
   let p6 = first(iTop, iImp, i => f(i) <= PF.p6); if (p6 < 0) p6 = li(iTop, iImp, .78);
   let p8 = first(iImp, iFin, i => g(i) >= PF.p8); if (p8 < 0) p8 = li(iImp, iFin, .25);
   let p9 = first(iImp, iFin, i => g(i) >= PF.p9); if (p9 < 0) p9 = li(iImp, iFin, .5);
+  // The finish is the end of the motion, not the moment the hands first get high: the body keeps turning and the
+  // club keeps wrapping round for about as long again as the hands took to get there from impact (GolfDB's swings).
+  // Stop sooner if the hands are already coming down out of the finish, or the clip ends.
+  { const hi = iFin, ym = y[hi]; let e = Math.min(n - 1, hi + Math.round(FIN_EXT * (hi - iImp)));
+    for (let i = hi + 1; i <= e; i++) if (y[i] > ym + .35 * L) { e = Math.max(hi, i - 1); break; }
+    iFin = e; }
   const P = [iAddr, p2, p3, iTop, p5, p6, iImp, p8, p9, iFin];
   for (let k = 1; k < 10; k++) if (P[k] <= P[k - 1]) P[k] = Math.min(n - 1, P[k - 1] + 1);
   return P;
@@ -1650,7 +1722,7 @@ function analyze(src) {
   }
   if (!synth) {
     const Lr = median(lm.slice(0, Math.max(3, Math.floor(lm.length * .15))).map(f => d2(mid(f[11], f[12]), mid(f[23], f[24])))) || 100;
-    lm = lm.slice(); wl = wl.slice(); fixSwaps(lm, wl, Lr); lm = cleanFrames(lm); wl = cleanFrames(wl);
+    lm = lm.slice(); wl = wl.slice(); fixSwaps(lm, wl, Lr); joinHands(lm, wl, Lr); const T_ = src.times, lm0 = lm; lm = cleanFrames(lm, T_, null, 1.5, .1 * Lr); wl = cleanFrames(wl, T_, lm0, .004, .05);
   }
   const n = lm.length;
   const torsoAt = i => d2(mid(lm[i][11], lm[i][12]), mid(lm[i][23], lm[i][24]));
@@ -2058,15 +2130,24 @@ function rootFlaw(an, others) {
    waits for the hands to settle low again, so the finish and the walk back can't count as another swing. */
 function scanSample(f) {
   const sh = mid(f[11], f[12]), hp = mid(f[23], f[24]), L = d2(sh, hp) || 1, wr = mid(f[15], f[16]);
-  return { hgt: (hp.y - wr.y) / L, tog: d2(f[15], f[16]) / L, ank: mid(f[27], f[28]), L };
+  return { hgt: (hp.y - wr.y) / L, tog: d2(f[15], f[16]) / L, ank: mid(f[27], f[28]), hip: hp, L };
 }
 function findSwings(samples, dur) {
   // k: how slowed-down this swing is. A real backswing takes the hands from address height to above the shoulders
   // in about half a second; a slow-motion clip saved at normal speed (an iPhone Slo-mo exported, or a replay) can
   // take 5 to 20 times that. Every time limit below stretches by k, so a slowed swing stays one swing.
   const LOW = .4, HIGH = .8, SETTLE = 1.3, ok = samples.filter(s => s && s.L > 0), tops = [];
-  let armed = true, lowFrom = null, cur = null, since = -Infinity;
+  let armed = true, lowFrom = null, cur = null, since = -Infinity, prev = null;
+  // A scene cut (an edited clip, a broadcast): the body jumps to a new place or size between two looks, which no
+  // swing does. Whatever came before it is another shot: start afresh, and a top just before the cut never had a
+  // downswing shown, so it is not a swing.
+  const cut = (p, q) => p && p.hip && q.hip && (d2(p.hip, q.hip) > .3 * q.L || Math.abs(Math.log(q.L / p.L)) > .12);
   for (const s of ok) {
+    if (cut(prev, s)) {
+      if (cur && s.t - cur.t < .6 * cur.k) tops.pop();
+      cur = tops[tops.length - 1] || null; armed = true; lowFrom = null; since = s.t;
+    }
+    prev = s;
     if (s.hgt < LOW) {
       if (lowFrom == null) lowFrom = s.t;
       if (s.t - lowFrom >= SETTLE * (cur ? cur.k : 1)) { armed = true; if (cur && cur.settle == null) cur.settle = lowFrom; since = lowFrom; }
@@ -2092,7 +2173,7 @@ function findSwings(samples, dur) {
   });
   return wins;
 }
-return { keyVals, hasCap, capSwing, proModel, clubParams, mono, rootFlaw, LEADS, scanSample, findSwings, mirrorFrame, ang3, mid, d2, proj3, PROS, DEMO, BASE, buildSwing, projectModel, analyze, proRun, ranges, matchScore, resemblance, idxAt, METRICS, VIEW_METRICS, P_NAMES, P_SHORT, P_PHASE, PF, CAM, IN_PER_TORSO, at };
+return { setFinExt: v => { FIN_EXT = v; }, keyVals, hasCap, capSwing, proModel, clubParams, mono, rootFlaw, LEADS, scanSample, findSwings, mirrorFrame, ang3, mid, d2, proj3, PROS, DEMO, BASE, buildSwing, projectModel, analyze, proRun, ranges, matchScore, resemblance, idxAt, METRICS, VIEW_METRICS, P_NAMES, P_SHORT, P_PHASE, PF, CAM, IN_PER_TORSO, at };
 })();
 if (typeof module !== 'undefined') module.exports = LG;
 
@@ -2984,7 +3065,7 @@ const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const DPR = Math.min(2.5, window.devicePixelRatio || 1);
 // Shown in settings and at the foot of the home screen, so it's always clear which build the phone is running
-const BUILD = 'Version 10, October 30', SW_VER = 'lagline-v10';
+const BUILD = 'Version 11, October 30', SW_VER = 'lagline-v11';
 // A Home Screen app can sit in memory for days. When it comes back to the front, check (with a 1 KB request) whether
 // a newer version has been uploaded, and offer to load it.
 let updAt = 0;
@@ -3395,7 +3476,9 @@ function getPose() {
     await pose.initialize();
     return {
       send: img => new Promise((res, rej) => { pending = res; pose.send({ image: img }).catch(e => { pending = null; rej(e); }); }),
-      reset: () => { try { pose.reset(); } catch (e) { /* older builds */ } }
+      reset: () => { try { pose.reset(); } catch (e) { /* older builds */ } },
+      // give its memory back (the club tracer needs it on a phone); the next getPose() starts a fresh one
+      close: async () => { posePromise = null; try { await pose.close(); } catch (e) { /* already gone */ } }
     };
   })().catch(e => { posePromise = null; throw e; });
   return posePromise;
@@ -3446,7 +3529,9 @@ async function playFrames(v, t0, t1, step, rate, onFrame) {
       if (lastPF && meta.presentedFrames === lastPF.n + 1) { const dt = t - lastPF.t; if (dt > .003 && dt < .05) FRAME_DUR = FRAME_DUR ? Math.min(FRAME_DUR, dt) : dt; }
       lastPF = { n: meta.presentedFrames, t };
       if (t >= t1 - .005) return stop(true);
-      if (t + .004 >= next) {
+      // take a frame once it is within a quarter step of the next one wanted (a fixed few-ms slack, counted twice,
+      // let a 240 fps Slo-mo through at nearly every frame for a 120 fps step: more frames than planned, and slower)
+      if (t >= next - .25 * step) {
         v.pause();
         inF = true;
         try {
@@ -3457,7 +3542,7 @@ async function playFrames(v, t0, t1, step, rate, onFrame) {
         inF = false;
         if (cancelProc) return stop(false, new Error('cancel'));
         if (ended) return stop(true);
-        next = t + step - .004;
+        next = t + step;
         arm(); v.play().catch(() => stop(false));
       } else arm();
     };
@@ -3507,10 +3592,20 @@ function tlDraw(scanned, wins, dur, active) {
   el.innerHTML = `<i class="tl-scan" style="width:${(100 * scanned).toFixed(1)}%"></i>` + wins.map((w, k) =>
     `<b class="${k === active ? 'on' : k < active ? 'done' : ''}" style="left:${(100 * w.t0 / dur).toFixed(2)}%;width:${Math.max(1.2, 100 * (w.t1 - w.t0) / dur).toFixed(2)}%"></b>`).join('');
 }
+// The skeleton shown while tracking: each point eased toward the new reading (more when the pose model is unsure of
+// it, less when it moves a lot, so fast arms are not dragged behind). For the eye only; the analysis smooths the
+// whole track afterwards.
+let procPrev = null;
 function drawProc(f, w, h) {
   const pcv = $('#procCv'), cw = pcv.clientWidth, ch = pcv.clientHeight; if (!cw || !ch) return;
   const g = fitCanvas(pcv, cw, ch); g.clearRect(0, 0, cw, ch);
-  if (!f) return;
+  if (!f) { procPrev = null; return; }
+  if (procPrev && procPrev.length === f.length) {
+    const L = Math.hypot(f[11].x - f[23].x, f[11].y - f[23].y) || 100;
+    f = f.map((p, j) => { const q = procPrev[j], d = Math.hypot(p.x - q.x, p.y - q.y) / L, a = Math.min(1, (.35 + 2.5 * d) * (.4 + .6 * (p.v == null ? 1 : p.v)));
+      return { x: q.x + a * (p.x - q.x), y: q.y + a * (p.y - q.y), v: p.v }; });
+  }
+  procPrev = f;
   const s = Math.min(cw / w, ch / h), ox = (cw - w * s) / 2, oy = (ch - h * s) / 2;
   drawSkeleton(g, f, p => ({ x: ox + p.x * s, y: oy + p.y * s }), { color: C.flag, w: 2, dots: false });
 }
@@ -4056,16 +4151,48 @@ async function refineClubTAM(it, onFrame) {
   // seen down the line the club exits on a steeper plane than it came in on, so the mirror is only approximate.)
   const ang = i => Math.atan2(sy[i] - (gr(i) || g1).y, sx[i] - (gr(i) || g1).x), len = i => Math.hypot(sx[i] - (gr(i) || g1).x, sy[i] - (gr(i) || g1).y);
   const P4 = P[4], P5 = P[5], P6 = P[6], P7 = P[7], P8 = Math.min(n - 1, P[8]), Lh = L0 / k;
-  let mirrored = 0;
+  let mirrored = 0, fin = -1;
   if (P4 >= i1 && P4 < P5 && P5 < P6 && P6 < P7 && P7 < P8) {
     const a6 = ang(P6), wrap = d => { while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; };
     const at2 = (fn, x) => { const j = Math.floor(x), f = x - j; return j + 1 > n - 1 ? fn(j) : fn(j) * (1 - f) + fn(j + 1) * f; };
     const angAt = x => { const j = Math.floor(x), f = x - j; return ang(j) + f * wrap(ang(Math.min(n - 1, j + 1)) - ang(j)); };
     const px = hx.slice(), py = hy.slice(), pw = w.slice();
-    for (let i = P6 + 1; i <= P8; i++) {
-      const j = i <= P7 ? P6 - (i - P6) / (P7 - P6) * (P6 - P5) : P5 - (i - P7) / (P8 - P7) * (P5 - P4);
-      const th = a6 - wrap(angAt(j) - a6), ln = at2(len, j), g = gr(i) || g1;
-      const qx = g.x + ln * Math.cos(th), qy = g.y + ln * Math.sin(th), wp = .1;
+    // The finish: the club comes to rest, so it is the easiest place of the follow-through to see. Look for the first
+    // stretch after P8 where the tracked head (not a short mask) has stayed nearly still over three steps running.
+    const fk = keys.filter(i => i > P8 && !H[i].short); let finA = null, finL = null;
+    for (let s = 0; s + 3 < fk.length; s++) {
+      let still = true;
+      for (let t = s; t < s + 3; t++) { const a = fk[t], b = fk[t + 1]; if (b - a > 3 * step || Math.hypot(hx[b] - hx[a], hy[b] - hy[a]) > .04 * Lh * (b - a)) { still = false; break; } }
+      if (!still) continue;
+      fin = fk[s + 1]; const run = fk.slice(s, s + 4), med = a => a.slice().sort((p, q) => p - q)[a.length >> 1];
+      const ra = run.map(i => { const g = gr(i) || g1; return Math.atan2(hy[i] - g.y, hx[i] - g.x); }), r0 = ra[0];
+      finA = r0 + med(ra.map(a => wrap(a - r0))); finL = med(run.map(i => { const g = gr(i) || g1; return Math.hypot(hx[i] - g.x, hy[i] - g.y); })); break;
+    }
+    // From impact to the finish the club turns about the hands: ease its angle (not its position — a straight line on
+    // the screen would cut through the golfer) and its seen length from impact's to the finish's, paced by how far the
+    // hands have travelled (the club whips through just after impact and slows into the finish). Which way round it
+    // goes, and how many turns, is taken from the tracked angles.
+    let finTh = null;
+    if (fin > P8) {
+      const l6 = len(P6); let cum = 0, prev = a6; const hand = [0];
+      for (let i = P6 + 1; i <= fin; i++) { const g = gr(i) || g1, g0 = gr(i - 1) || g1; hand.push(hand[hand.length - 1] + Math.hypot(g.x - g0.x, g.y - g0.y));
+        if (sx[i] != null) { const a = ang(i); cum += wrap(a - prev); prev = a; } }
+      let D = wrap(finA - a6); const cands = [D - 2 * Math.PI, D, D + 2 * Math.PI]; D = cands.reduce((b, c) => Math.abs(c - cum) < Math.abs(b - cum) ? c : b);
+      const H0 = hand[hand.length - 1] || 1;
+      finTh = i => { const u = hand[i - P6] / H0; return { u, th: a6 + u * D, ln: l6 + u * (finL - l6) }; };
+    }
+    const end = finTh ? fin : P8;
+    for (let i = P6 + 1; i <= end; i++) {
+      const g = gr(i) || g1; let qx, qy;
+      if (i <= P8) {
+        const j = i <= P7 ? P6 - (i - P6) / (P7 - P6) * (P6 - P5) : P5 - (i - P7) / (P8 - P7) * (P5 - P4);
+        const th = a6 - wrap(angAt(j) - a6), ln = at2(len, j); qx = g.x + ln * Math.cos(th); qy = g.y + ln * Math.sin(th);
+      }
+      if (finTh) {   // the finish's pull grows as the swing nears it; past P8 it is the only guide
+        const f = finTh(i), fx = g.x + f.ln * Math.cos(f.th), fy = g.y + f.ln * Math.sin(f.th);
+        if (qx == null) { qx = fx; qy = fy; } else { qx = (1 - f.u) * qx + f.u * fx; qy = (1 - f.u) * qy + f.u * fy; }
+      }
+      const wp = .1;
       if (w[i] > 0 && hx[i] != null) {
         const wm = Math.hypot(hx[i] - qx, hy[i] - qy) < .6 * Lh ? w[i] : .2 * w[i];
         px[i] = (wm * hx[i] + wp * qx) / (wm + wp); py[i] = (wm * hy[i] + wp * qy) / (wm + wp); pw[i] = wm + wp;
@@ -4074,16 +4201,16 @@ async function refineClubTAM(it, onFrame) {
     }
     sx = whittaker(px, pw, lam, 2, 4); sy = whittaker(py, pw, lam, 2, 4);
   }
-  it.tamMirror = mirrored;
+  it.tamMirror = mirrored; it.tamFinish = fin;
   const frames2 = [];
   for (let i = 0; i < n; i++) { const g = gr(i) || g1; frames2.push(i < i1 ? { gx: g.x, gy: g.y, hx: hd.x, hy: hd.y, est: true } : { gx: g.x, gy: g.y, hx: sx[i], hy: sy[i], est: !H[i] || H[i].short }); }
-  const last = Math.max(keys[keys.length - 1], mirrored ? Math.min(n - 1, P[8]) : 0); for (let i = last + 1; i < n; i++) frames2[i] = null;
+  const last = Math.max(keys[keys.length - 1], mirrored ? Math.min(n - 1, Math.max(P[8], fin)) : 0); for (let i = last + 1; i < n; i++) frames2[i] = null;
   it.raw.club = frames2; it.clubQ = keys.length / Math.ceil(total / step); it.clubBy = 'tam';
   analyzeItem(it); return true;
 }
 // Pass 1: a quick look at the whole clip, about 6 frames a second, just to find where the swings are.
 async function scanClip(v, pose, w, h, dur) {
-  pose.reset();
+  pose.reset(); procPrev = null;
   const sc = Math.min(1, 480 / Math.max(w, h)), cv = document.createElement('canvas');
   cv.width = Math.round(w * sc); cv.height = Math.round(h * sc);
   const g = cv.getContext('2d'), samples = []; let wins = [], j = 0;
@@ -4107,7 +4234,7 @@ async function scanClip(v, pose, w, h, dur) {
 }
 // Pass 2: every frame of one swing window, saved as JPEGs so playback shows exactly the frames we measured.
 async function trackWindow(v, pose, w, h, win, fmax, onFrame) {
-  pose.reset();
+  pose.reset(); procPrev = null;
   let step = FRAME_DUR && FRAME_DUR < 1 / 45 ? Math.max(1 / 120, FRAME_DUR * .999) : 1 / 30; if ((win.t1 - win.t0) / step > 360) step = (win.t1 - win.t0) / 360;
   const times = []; for (let t = win.t0; t < win.t1 - .02; t += step) times.push(t);
   const fsc = Math.min(1, fmax / Math.max(w, h)), fw = Math.round(w * fsc), fh = Math.round(h * fsc);
@@ -4162,9 +4289,25 @@ function makeSwing(tr, w, h, base, strict) {
   return it;
 }
 // follow the club with EdgeTAM once the swing is known (keeps the detector's path if the model can't load or loses it)
+// On a phone this is the heaviest step: a phone that runs out of memory closes the page without a word. So first
+// hand back the body model's and the club detector's memory, and leave a note while it runs: if the page is killed,
+// the note is still there next time, and this phone keeps the detector's club path from then on.
+const TAM_RUN = 'lagline-tam-running', TAM_OFF = 'lagline-tam-off';
+const lsGet = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+const lsSet = (k, v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) { /* private mode */ } };
+if (lsGet(TAM_RUN)) { lsSet(TAM_OFF, SW_VER); lsSet(TAM_RUN, null); }   // per build: a later build gets to try again
+async function freeForTam() {
+  try { if (posePromise) { const p = await posePromise; if (p.close) await p.close(); } } catch (e) { posePromise = null; }
+  try { if (clubNetP) { const c = await clubNetP; clubNetP = null; await c.sess.release(); } } catch (e) { clubNetP = null; }
+}
+async function freeTam() { try { if (tamP) { const t = await tamP; tamP = null; for (const s of [t.VE, t.MD, t.MA, t.ME]) await s.release(); } } catch (e) { tamP = null; } }
 async function tamFor(it, k, n) {
+  if (lsGet(TAM_OFF) === SW_VER) return;
+  await freeForTam();
+  lsSet(TAM_RUN, String(Date.now()));
   try { await refineClubTAM(it, (j, m) => busy(n > 1 ? `Tracing the club, swing ${k + 1} of ${n}` : 'Tracing the club', `Frame ${j + 1} of ${m}`, .3 + .7 * (k + (j + 1) / m) / n, cancelAct())); }
-  catch (e) { if (e && e.message === 'cancel') throw e; console.warn('club tracking fell back:', e && e.message); }
+  catch (e) { if (e && e.message === 'cancel') { lsSet(TAM_RUN, null); throw e; } console.warn('club tracking fell back:', e && e.message); }
+  lsSet(TAM_RUN, null);
 }
 async function processFile(file) {
   if (!file) return;
@@ -4196,18 +4339,21 @@ async function processFile(file) {
         if (dur > 5) tlDraw(1, wins, dur, k);
       });
       const it = makeSwing(tr, w, h, base, wins.length > 1 || dur > 5);
-      if (it) { await tamFor(it, k, n); items.push(it); } else tracked.push(tr);
+      if (it) items.push(it); else tracked.push(tr);
     }
     // 3. the strict check (tempo in a golf range) turned every window down: take the best of what's already tracked
     //    rather than tracking the clip again
-    if (!items.length && tracked.length) for (const tr of tracked) { const it = makeSwing(tr, w, h, base, false); if (it) { await tamFor(it, 0, 1); items.push(it); break; } }
+    if (!items.length && tracked.length) for (const tr of tracked) { const it = makeSwing(tr, w, h, base, false); if (it) { items.push(it); break; } }
     // 4. no swing-shaped window at all in a shortish clip: track it whole, the way a single-swing clip is handled
     if (!items.length && !wins.length && dur > 5 && dur <= 25) {
       const tr = await trackWindow(v, pose, w, h, { t0: 0, t1: dur }, FRAME_MAX, (j, m) => busy('Tracking your swing', `Frame ${j + 1} of ${m}`, (j + 1) / m, cancelAct()));
       if (tr.found < tr.times.length * .5) throw new Error('Couldn’t find a golfer in most frames. Keep your whole body and club in the shot, with even light.');
-      const it = makeSwing(tr, w, h, base, false); if (it) { await tamFor(it, 0, 1); items.push(it); }
+      const it = makeSwing(tr, w, h, base, false); if (it) items.push(it);
     }
     if (!items.length) throw new Error(NO_SWING);
+    // 5. the club, once every swing has its body track (the club tracer needs the body model's memory)
+    for (let k = 0; k < items.length; k++) await tamFor(items[k], k, items.length);
+    await freeTam();
     releaseVideo(v, url); unbusy();
     await finishClip(items, base, dur, capped);
   } catch (e) {
