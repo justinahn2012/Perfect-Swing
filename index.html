@@ -1401,10 +1401,58 @@ function decodeCap(c) {
   const a = new Int16Array(bin.buffer, bin.byteOffset, bin.byteLength / 2), W = a.length / c.meta.n;
   return Array.from({ length: c.meta.n }, (_, i) => a.subarray(i * W, (i + 1) * W));
 }
-function capSwing(key, p) {
-  const c = CAPS_[key], rows = decodeCap(c), M = c.meta, n = M.n60, CL = M.club, fps = 60;
-  const at = (i, o, s) => { const x = i / M.step, k = Math.min(rows.length - 2, Math.floor(x)), f = Math.min(1, x - k), r0 = rows[k], r1 = rows[k + 1];
+// A capture whose follow-through came out wrong (Morikawa's: head, hips and legs drift off at the finish) borrows it
+// from the others: their motion after the release, taken relative to the hips, scaled to his size and timed to his
+// own release / trail-arm-up / finish, averaged, and blended in from his release on.
+const CAP_FIX = { 'morikawa:iron': ['tiger:iron', 'korda:iron', 'tiger:driver'] };
+const capCache = {};
+function capRaw(key) {
+  if (capCache[key]) return capCache[key];
+  const c = CAPS_[key], rows = decodeCap(c), M = c.meta;
+  const at = (i, o, s) => { const x = Math.max(0, i) / M.step, k = Math.min(rows.length - 2, Math.floor(x)), f = Math.min(1, x - k), r0 = rows[k], r1 = rows[k + 1];
     return [0, 1, 2].map(j => (r0[o + j] * (1 - f) + r1[o + j] * f) / s); };
+  const hip = i => mul(add(at(i, 18, 1000), at(i, 21, 1000)), .5), sh = i => mul(add(at(i, 0, 1000), at(i, 3, 1000)), .5);
+  const torso = len(sub(hip(M.P[0]), sh(M.P[0])));
+  return (capCache[key] = { M, at, hip, torso });
+}
+function capFixedAt(key) {
+  const me = capRaw(key), M = me.M, donors = (CAP_FIX[key] || []).filter(k => CAPS_[k]).map(capRaw);
+  if (!donors.length) return me.at;
+  const end = M.n60 - 1, s0 = M.P[7];
+  // my frame i (after the release) -> the donor's frame at the same point between the same swing positions
+  // (after the finish the donor's pose is held: some captures run on into stepping away)
+  const warp = (D, i) => { const A = [M.P[7], M.P[8], M.P[9], end], B = [D.M.P[7], D.M.P[8], D.M.P[9], D.M.P[9]];
+    for (let k = 0; k < 3; k++) if (i <= A[k + 1] || k === 2) { const u = (i - A[k]) / Math.max(1, A[k + 1] - A[k]); return B[k] + Math.min(1, u) * (B[k + 1] - B[k]); } };
+  const POS = [...Array(16).keys()].map(k => k * 3).concat([48, 54]), DIR = [51, 57];
+  const cache = new Map();
+  const donorAt = i => {
+    if (cache.has(i)) return cache.get(i);
+    const o = {};
+    for (const D of donors) {
+      const j = warp(D, i), sc = me.torso / D.torso, j7 = D.M.P[7];
+      // my pose at the release, moved the way theirs moves from their release on (scaled to my size): my feet stay
+      // planted where they were, and pick up the others' roll and heel lift
+      for (const off of POS) { const v = add(me.at(s0, off, 1000), mul(sub(D.at(j, off, 1000), D.at(j7, off, 1000)), sc)); o[off] = o[off] ? add(o[off], v) : v; }
+      for (const off of DIR) { const v = norm(D.at(j, off, 10000)); o[off] = o[off] ? add(o[off], v) : v; }
+    }
+    for (const off of POS) o[off] = mul(o[off], 1 / donors.length);
+    for (const off of DIR) o[off] = norm(o[off]);
+    cache.set(i, o); return o;
+  };
+  // ease from my own motion at the release into the borrowed one by the time the trail arm is up; the borrowed
+  // motion is shifted so it starts exactly where mine is at the release, and that shift fades out by then too
+  const off7 = {}; { const o = donorAt(s0); for (const off of POS) off7[off] = sub(me.at(s0, off, 1000), o[off]); }
+  return (i, off, s) => {
+    if (i <= s0 || (!POS.includes(off) && !DIR.includes(off))) return me.at(i, off, s);
+    const u = Math.min(1, (i - s0) / Math.max(1, M.P[8] - s0)), w = u * u * (3 - 2 * u), o = donorAt(i), mine = me.at(i, off, s);
+    if (DIR.includes(off)) return mul(norm(add(mul(norm(mine), 1 - w), mul(o[off], w))), 10000 / s);
+    const borrowed = add(o[off], mul(off7[off], 1 - w));
+    return mul(add(mul(mine, (1 - w) * s / 1000), mul(borrowed, w)), 1000 / s);
+  };
+}
+function capSwing(key, p) {
+  const c = CAPS_[key], M = c.meta, n = M.n60, CL = M.club, fps = 60;
+  const at = capFixedAt(key);
   const frames = [], times = [];
   for (let i = 0; i < n; i++) {
     const pts = new Array(33);
@@ -2936,7 +2984,7 @@ const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const DPR = Math.min(2.5, window.devicePixelRatio || 1);
 // Shown in settings and at the foot of the home screen, so it's always clear which build the phone is running
-const BUILD = 'Version 9, October 30', SW_VER = 'lagline-v9';
+const BUILD = 'Version 10, October 30', SW_VER = 'lagline-v10';
 // A Home Screen app can sit in memory for days. When it comes back to the front, check (with a 1 KB request) whether
 // a newer version has been uploaded, and offer to load it.
 let updAt = 0;
