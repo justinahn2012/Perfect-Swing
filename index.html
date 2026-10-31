@@ -2819,6 +2819,100 @@ function shell(profile, w, d, seg) {
 const ellip = (x, y, z) => { const g = new T.SphereGeometry(1, 28, 18); g.scale(x, y, z); return g; };
 function mesh(g, m) { const o = new T.Mesh(g, m); o.castShadow = true; o.receiveShadow = true; return o; }
 
+/* ---------- the test dummy: a see-through body with its joints and bones inside ----------
+   Every body part is a clear shell, bright at its outline and faint in the middle, so the shape reads at a glance
+   and the skeleton inside shows through: yellow joints (shoulders, elbows, wrists, hips, knees, ankles) joined by
+   pale bones, crash-test target marks on the head and hips. The same figure, tinted yellow, is the pro overlay. */
+const XRAY_VS = `varying vec3 vN; varying vec3 vV;
+void main(){ vec4 mv = modelViewMatrix * vec4(position, 1.0); vN = normalize(normalMatrix * normal); vV = -mv.xyz; gl_Position = projectionMatrix * mv; }`;
+const XRAY_FS = `uniform vec3 uCol; uniform vec3 uRimCol; uniform float uA; uniform float uRim; varying vec3 vN; varying vec3 vV;
+void main(){ vec3 n = normalize(vN), v = normalize(vV); float f = 1.0 - abs(dot(n, v)); float rim = pow(f, 2.2);
+  float lit = .62 + .38 * max(dot(n, normalize(vec3(.35, .65, .65))), 0.0);
+  vec3 c = mix(uCol * lit, uRimCol, rim * .85); gl_FragColor = vec4(c, clamp(uA + uRim * rim, 0.0, 1.0)); }`;
+function xray(col, rimCol, a, rim) {
+  return new T.ShaderMaterial({ uniforms: { uCol: { value: new T.Color(col) }, uRimCol: { value: new T.Color(rimCol) }, uA: { value: a }, uRim: { value: rim } },
+    vertexShader: XRAY_VS, fragmentShader: XRAY_FS, transparent: true, depthWrite: false, toneMapped: false });
+}
+const DUM = {
+  shell: xray('#b9cbc4', '#ffffff', .2, .95), shellHi: xray('#f5c84c', '#fff3c9', .34, .7),
+  shellGhost: xray('#f5c84c', '#fff1c4', .22, .9),
+  joint: new T.MeshStandardMaterial({ color: '#f5c84c', emissive: '#7a5a0c', emissiveIntensity: .75, roughness: .35, metalness: .1 }),
+  jointGhost: new T.MeshBasicMaterial({ color: '#ffffff' }),
+  bone: new T.MeshStandardMaterial({ color: '#dfe7e2', emissive: '#3d4643', emissiveIntensity: .5, roughness: .5 }),
+  boneGhost: new T.MeshBasicMaterial({ color: '#fff1c4' }),
+};
+function targetTex() {
+  return canvasTex(128, 128, (g, w) => { const r = w / 2;
+    for (let q = 0; q < 4; q++) { g.beginPath(); g.moveTo(r, r); g.arc(r, r, r - 4, q * Math.PI / 2, (q + 1) * Math.PI / 2); g.closePath(); g.fillStyle = q % 2 ? '#111614' : '#f5c84c'; g.fill(); }
+    g.lineWidth = 6; g.strokeStyle = '#111614'; g.beginPath(); g.arc(r, r, r - 4, 0, Math.PI * 2); g.stroke(); });
+}
+function buildDummy() {
+  const d = { root: new T.Group(), seg: {}, joints: [], bones: [], marks: [] };
+  d.root.visible = false;
+  const seg = (name, geo) => { const o = new T.Mesh(geo, DUM.shell); o.castShadow = true; o.renderOrder = 2; o.frustumCulled = false; o.userData.L0 = geo.userData.L0 || 1; d.root.add(o); d.seg[name] = o; return o; };
+  const cap = (r1, r2, L) => { const g = taper(r1, r2, L, 20); g.userData.L0 = L; return g; };
+  for (const s of ['L', 'R']) {
+    seg('upper' + s, cap(.052, .044, .3)); seg('fore' + s, cap(.043, .034, .26));
+    seg('thigh' + s, cap(.085, .062, .4)); seg('shin' + s, cap(.06, .046, .42));
+    seg('hand' + s, ellip(.036, .052, .028));
+    seg('foot' + s, (() => { const g = new T.CapsuleGeometry(.045, .17, 6, 14); g.rotateX(Math.PI / 2); g.scale(1.05, .7, 1); return g; })());
+  }
+  seg('chest', ellip(.175, .19, .112)); seg('pelvis', ellip(.165, .105, .112)); seg('waist', cap(.115, .13, .2));
+  seg('neck', cap(.048, .045, .1)); seg('skull', ellip(.09, .113, .101));
+  const jg = new T.SphereGeometry(1, 18, 12), bg = new T.CylinderGeometry(1, 1, 1, 8); bg.translate(0, .5, 0);
+  for (let k = 0; k < 15; k++) { const j = new T.Mesh(jg, DUM.joint); j.renderOrder = 1; d.root.add(j); d.joints.push(j); }
+  for (let k = 0; k < 16; k++) { const b = new T.Mesh(bg, DUM.bone); b.renderOrder = 1; d.root.add(b); d.bones.push(b); }
+  const tm = new T.MeshBasicMaterial({ map: targetTex(), transparent: true, depthWrite: false, toneMapped: false });
+  const dg = new T.CircleGeometry(1, 32);
+  for (let k = 0; k < 4; k++) { const m = new T.Mesh(dg, tm); m.renderOrder = 3; d.root.add(m); d.marks.push(m); }
+  return d;
+}
+const _dz = new T.Vector3(0, 0, 1);
+function poseDummy(d, fr) {
+  const P = fr.pts.map(vec), LS = P[11], RS = P[12], LH = P[23], RH = P[24];
+  const sm = LS.clone().add(RS).multiplyScalar(.5), hm = LH.clone().add(RH).multiplyScalar(.5), up = sm.clone().sub(hm).normalize();
+  const bP = ortho(up, new T.Vector3().crossVectors(LH.clone().sub(RH), up)), bC = ortho(up, new T.Vector3().crossVectors(LS.clone().sub(RS), up));
+  const seg = (name, a, b) => { const o = d.seg[name]; place(o, a, b); o.scale.set(1, a.distanceTo(b) / o.userData.L0, 1); };
+  const tl = sm.distanceTo(hm);
+  basis(d.seg.chest, bC.x, bC.y, bC.z, sm.clone().addScaledVector(up, -.15 * tl / .52)); d.seg.chest.scale.set(1, tl / .52, 1);
+  basis(d.seg.pelvis, bP.x, bP.y, bP.z, hm.clone().addScaledVector(up, .03)); 
+  seg('waist', hm.clone().addScaledVector(up, .07), sm.clone().addScaledVector(up, -.25 * tl / .52));
+  const H = vec(fr.H), nb = sm.clone().addScaledVector(up, .02);
+  seg('neck', nb, H.clone().addScaledVector(up, -.06));
+  const hu = H.clone().sub(nb).normalize(), bH = ortho(hu, P[0].clone().sub(H)); basis(d.seg.skull, bH.x, bH.y, bH.z, H);
+  const dir = vec(fr.head).sub(vec(fr.grip)).normalize();
+  for (const [s, k] of [['L', 0], ['R', 1]]) {
+    const S = P[11 + k], E = P[13 + k], W = P[15 + k], Hp = P[23 + k], K = P[25 + k], A = P[27 + k], He = P[29 + k], To = P[31 + k];
+    seg('upper' + s, S, E); seg('fore' + s, E, W);
+    const hd = fr.free && (fr.free === true || fr.free[s === 'L' ? 'Left' : 'Right']) ? W.clone().sub(E).normalize() : dir;
+    d.seg['hand' + s].position.copy(W).addScaledVector(hd, .035); d.seg['hand' + s].quaternion.setFromUnitVectors(UPY, hd);
+    seg('thigh' + s, Hp, K); seg('shin' + s, K, A);
+    const fz = To.clone().sub(He); if (fz.lengthSq() < 1e-6) fz.set(0, 0, 1); fz.normalize();
+    const fy = UPY.clone().addScaledVector(fz, -fz.y).normalize(), fx = new T.Vector3().crossVectors(fy, fz);
+    basis(d.seg['foot' + s], fx, fy, fz, He.clone().add(To).multiplyScalar(.5).setY(Math.max(.032, (He.y + To.y) / 2)));
+  }
+  // joints: big ones where the measurements live, small ones along the spine
+  const J = [[LS, .03], [RS, .03], [P[13], .026], [P[14], .026], [P[15], .022], [P[16], .022], [LH, .032], [RH, .032], [P[25], .03], [P[26], .03], [P[27], .024], [P[28], .024], [hm, .02], [sm, .02], [nb, .018]];
+  J.forEach(([p, r], k) => { const j = d.joints[k]; j.position.copy(p); j.scale.setScalar(r); });
+  const B = [[LS, RS], [LS, P[13]], [P[13], P[15]], [RS, P[14]], [P[14], P[16]], [LH, RH], [LH, P[25]], [P[25], P[27]], [RH, P[26]], [P[26], P[28]], [hm, sm], [nb, H],
+    [P[27], P[31]], [P[28], P[32]], [P[15], P[15].clone().addScaledVector(dir, .07)], [P[16], P[16].clone().addScaledVector(dir, .07)]];
+  B.forEach(([a, b], k) => { const o = d.bones[k]; place(o, a, b); o.scale.set(.011, a.distanceTo(b), .011); });
+  // crash-test targets: both sides of the head and the outside of each hip
+  const mk = (m, at, n, r) => { m.position.copy(at); m.quaternion.setFromUnitVectors(_dz, n); m.scale.setScalar(r); };
+  mk(d.marks[0], H.clone().addScaledVector(bH.x, .092), bH.x, .04); mk(d.marks[1], H.clone().addScaledVector(bH.x, -.092), bH.x.clone().negate(), .04);
+  const hx = LH.clone().sub(RH).normalize();
+  mk(d.marks[2], LH.clone().addScaledVector(hx, .11), hx, .04); mk(d.marks[3], RH.clone().addScaledVector(hx, -.11), hx.clone().negate(), .04);
+}
+function dummyMats(d, ghost, hi) {
+  const HI = { chest: ['chest'], hips: ['pelvis'], upperL: ['upperL'], sleeveL: ['upperL'], foreL: ['foreL'], upperR: ['upperR'], sleeveR: ['upperR'], foreR: ['foreR'],
+    thighL: ['thighL'], shinL: ['shinL'], thighR: ['thighR'], shinR: ['shinR'], skull: ['skull'], ear: ['skull'] };
+  const lit = new Set(); (hi || []).forEach(h => (HI[h] || []).forEach(x => lit.add(x)));
+  for (const k in d.seg) d.seg[k].material = ghost ? DUM.shellGhost : lit.has(k) ? DUM.shellHi : DUM.shell;
+  d.joints.forEach(j => { j.material = ghost ? DUM.jointGhost : DUM.joint; });
+  d.bones.forEach(b => { b.material = ghost ? DUM.boneGhost : DUM.bone; });
+  d.marks.forEach(m => { m.visible = !ghost; });
+}
+
 /* ---------- the figure ---------- */
 function buildFigure() {
   const f = { root: new T.Group(), parts: {} };
@@ -2878,6 +2972,7 @@ function buildFigure() {
   for (const k of ['m', 'f']) { try { f.chars[k] = buildChar(CHAR_SETS[k]); } catch (e) { f.chars[k] = null; } if (f.chars[k]) { f.chars[k].mesh.visible = false; f.root.add(f.chars[k].mesh); } }
   if (!f.chars.m) f.chars.m = f.chars.f; if (!f.chars.f) f.chars.f = f.chars.m;
   f.char = null; useChar(f, 'm');
+  f.dummy = buildDummy(); f.root.add(f.dummy.root);
   if (f.char) for (const k in f.parts) if (!['cap', 'brim', 'shoeL', 'shoeR', 'soleL', 'soleR', 'cuffL', 'cuffR', 'collarL', 'collarR'].includes(k)) f.parts[k].visible = false;   // the body replaces the primitives
   return f;
 }
@@ -3322,6 +3417,10 @@ function draw(g, o) {
   const fr = o.model.frames[o.i];
   useChar(fig, o.female || /^korda/.test(o.key || '') ? 'f' : 'm');
   pose(fig, o.frame || fr, o.model); setMats(fig, o.key || 'pro', !!o.ghost, o.highlight); setProps(o.props);
+  const dm = !o.real && fig.dummy;
+  if (fig.dummy) { fig.dummy.root.visible = !!dm; if (dm) { poseDummy(fig.dummy, o.frame || fr); dummyMats(fig.dummy, !!o.ghost, o.highlight); } }
+  if (fig.char) fig.char.mesh.visible = !dm;
+  for (const k of ['cap', 'brim', 'shoeL', 'shoeR', 'soleL', 'soleR', 'cuffL', 'cuffR', 'collarL', 'collarR']) if (fig.parts[k]) fig.parts[k].visible = !dm;
   const ghost = !!o.ghost;
   env.range.visible = !ghost; fig.ball.visible = !ghost;
   env.hemi.intensity = .42; env.spot.castShadow = !ghost;
@@ -3382,7 +3481,7 @@ const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const DPR = Math.min(2.5, window.devicePixelRatio || 1);
 // Shown in settings and at the foot of the home screen, so it's always clear which build the phone is running
-const BUILD = 'Version 16, October 30', SW_VER = 'lagline-v16';
+const BUILD = 'Version 18, October 31', SW_VER = 'lagline-v18';
 // A Home Screen app can sit in memory for days. When it comes back to the front, check (with a 1 KB request) whether
 // a newer version has been uploaded, and offer to load it.
 let updAt = 0;
@@ -3679,13 +3778,15 @@ function drawClubPath(g, an, M, i) {
   const segs = [[P[0], P[3], 'rgba(190,168,255,.95)'], [P[3], P[6], 'rgba(255,128,214,.95)'], [P[6], P[9], 'rgba(235,240,234,.75)']];
   g.lineCap = 'round'; g.lineJoin = 'round';
   for (const [s0, e, col] of segs) {
-    const path = (to) => { g.beginPath(); let on = false; for (let j = s0; j <= to; j++) { const ps = j < to ? H[j] : H[j].slice(0, 1); for (const p of ps) { on ? g.lineTo(p.x, p.y) : g.moveTo(p.x, p.y); on = true; } } g.stroke(); };
+    // only where the club was actually seen: a guessed stretch leaves a gap rather than a made-up curve
+    const path = (to) => { g.beginPath(); let on = false; for (let j = s0; j <= to; j++) { if (c[j] && c[j].est && !(c[j - 1] && !c[j - 1].est && c[j + 1] && !c[j + 1].est)) { on = false; continue; } const ps = j < to ? H[j] : H[j].slice(0, 1); for (const p of ps) { on ? g.lineTo(p.x, p.y) : g.moveTo(p.x, p.y); on = true; } } g.stroke(); };
     g.strokeStyle = col; g.globalAlpha = .22; g.lineWidth = 2; path(e);
     const ee = Math.min(e, i); if (ee > s0) { g.globalAlpha = 1; g.lineWidth = 3; path(ee); }
   }
   g.globalAlpha = 1;
   const q = c[i], gp = M(q.g), hp = M(q.h);
-  g.strokeStyle = 'rgba(255,255,255,.85)'; g.lineWidth = 2; if (q.est) g.setLineDash([5, 5]); seg(g, gp, hp); g.setLineDash([]);
+  if (q.est && !(c[i - 1] && !c[i - 1].est && c[i + 1] && !c[i + 1].est)) return true;   // not seen in this frame: draw no club rather than a guess
+  g.strokeStyle = 'rgba(255,255,255,.85)'; g.lineWidth = 2; seg(g, gp, hp);
   g.fillStyle = '#C9B8FF'; g.beginPath(); g.arc(hp.x, hp.y, 5.5, 0, 7); g.fill(); g.strokeStyle = C.bg; g.lineWidth = 2; g.stroke();
   return true;
 }
@@ -4299,7 +4400,15 @@ function solveClubNet(track, an, T) {
       const jump = Math.hypot(out[q].hx - out[q - 1].hx, out[q].hy - out[q - 1].hy) > .55 * Lc, far = Math.hypot(out[q].hx - out[q].gx, out[q].hy - out[q].gy) > 1.3 * Lc;
       miss = pick[q].k < 0 ? miss + 1 : 0;
       if (miss >= 3 || jump || far) { for (let r = q; r < n; r++) out[r] = null; break; } } }
-  const i1 = Math.min(P[0], n - 1), head0 = pA ? { x: pA[0], y: pA[1] } : { x: out[i1].hx, y: out[i1].hy };
+  const i1 = Math.min(P[0], n - 1);
+  // at address the detector's point sits toward the heel (where the shaft enters the head), consistently: measured
+  // against 44 hand-tapped address frames it is 1.6% of the club short along the shaft and 0.5% to the heel side.
+  // Shift it to the middle of the clubface (down the line; face-on gets the along-the-shaft part only).
+  if (Lc) for (let q = 0; q <= i1; q++) { const o = out[q]; if (!o) continue;
+    const ux = o.hx - o.gx, uy = o.hy - o.gy, l = Math.hypot(ux, uy) || 1, ax = ux / l, ay = uy / l;
+    const perp = an.view === 'DTL' ? (an.hand === 'L' ? .005 : -.005) * Lc : 0;
+    o.hx += .016 * Lc * ax - perp * ay; o.hy += .016 * Lc * ay + perp * ax; }
+  const head0 = out[i1] ? { x: out[i1].hx, y: out[i1].hy } : pA ? { x: pA[0], y: pA[1] } : null;
   return { frames: out, head0, quality: good / n, net: true };
 }
 /* ---------- the club, followed through the swing (EdgeTAM: Meta's small video "segment anything" model) ----------
@@ -4770,6 +4879,77 @@ async function tamFor(it, k, n) {
     restore();
   }
   lsSet(TAM_RUN, null);
+}
+/* ---------- inside the iPhone app: the native engine does the heavy work ----------
+   The app reads every frame of the video exactly (its own time stamps), runs Apple's body tracking on the Neural
+   Engine, and for each swing adds 3D body pose and the club detector. This takes the place of the in-browser
+   playback, MediaPipe and ONNX steps; everything after (swing positions, the club path, the coaching) is the same. */
+const IN_APP = !!(window.NATIVE && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.native);
+const native = (cmd, args) => window.webkit.messageHandlers.native.postMessage(Object.assign({ cmd }, args || {}));
+window.__nativeProgress = (stage, frac) => { try { busy(stage, `${Math.round(frac * 100)}%`, frac * (stage.startsWith('Reading') ? .4 : 1), cancelAct()); } catch (e) { /* not busy */ } };
+async function processNative(camera) {
+  cancelProc = false;
+  const pv = $('#busyPv'); pv.hidden = true; $('#busyTl').hidden = true;
+  try {
+    busy(camera ? 'Opening the camera' : 'Choose a swing video', '', 0, cancelAct());
+    const meta = await native('pick', { camera: !!camera });
+    if (!meta || meta.cancelled) { unbusy(); return; }
+    const { w, h, dur, times } = meta, n = meta.n;
+    if (!n) throw new Error('The video has no readable frames.');
+    if (dur > MAX_CLIP) throw new Error(`That clip is ${mmss(dur)} long. Keep recordings under 5 minutes, or trim this one in Photos first.`);
+    FRAME_DUR = meta.fps > 0 ? 1 / meta.fps : (times.length > 1 ? (times[times.length - 1] - times[0]) / (times.length - 1) : 1 / 30); FD_FILE = true;
+    const LM = meta.lm.map(f => (f ? f.map(p => ({ x: p[0], y: p[1], v: p[2] })) : null));
+    // 1. where are the swings? (the same scan as the web version, from frames about a sixth of a second apart)
+    let wins;
+    if (dur <= 5) wins = [{ t0: 0, t1: dur }];
+    else {
+      const samples = []; let next = 0;
+      for (let i = 0; i < n; i++) { if (times[i] < next - 1e-6) continue; next = times[i] + 1 / SCAN_FPS; samples.push(LM[i] ? Object.assign({ t: times[i] }, LG.scanSample(LM[i])) : null); }
+      wins = LG.findSwings(samples, dur);
+    }
+    let capped = 0; if (wins.length > MAX_SWINGS) { capped = wins.length; wins = wins.slice(0, MAX_SWINGS); }
+    const base = 'Your swing', items = [], tracked = [];
+    // 2. each swing: 3D pose and the club detector natively, at most 360 frames a swing
+    const idx = t => { let lo = 0, hi = n - 1; while (lo < hi) { const m = (lo + hi) >> 1; if (times[m] < t) lo = m + 1; else hi = m; } return lo; };
+    for (let k = 0; k < wins.length; k++) {
+      const i0 = idx(wins[k].t0), i1 = Math.max(i0, idx(wins[k].t1) - 1), step = Math.max(1, Math.ceil((i1 - i0 + 1) / 360));
+      busy(wins.length > 1 ? `Analyzing swing ${k + 1} of ${wins.length}` : 'Tracking your swing', '', .4 + .5 * k / wins.length, cancelAct());
+      const r = await native('track', { i0, i1, step });
+      const tr = { times: [], lm: [], wl: [], frames: [], found: 0, club: [] };
+      for (let j = 0, i = r.i0; i <= i1; i += r.step, j++) {
+        const f = LM[i], wl = r.wl[j], det = r.det[j];
+        tr.times.push(times[i]);
+        tr.frames.push(await (await fetch(`psframe://f/${i}.jpg`)).blob());
+        if (f && wl) {
+          tr.lm.push(f); tr.wl.push(wl.map(p => ({ x: p[0], y: p[1], z: p[2] }))); tr.found++;
+          const g = gripOf(f); tr.club.push({ gx: g.x, gy: g.y, ok: false, det: det || null });
+        } else { tr.lm.push(null); tr.wl.push(null); tr.club.push(null); }
+        if (cancelProc) throw new Error('cancel');
+      }
+      const it = makeSwing(tr, w, h, base, wins.length > 1 || dur > 5);
+      if (it) items.push(it); else tracked.push(tr);
+    }
+    if (!items.length && tracked.length) for (const tr of tracked) { const it = makeSwing(tr, w, h, base, false); if (it) { items.push(it); break; } }
+    if (!items.length) throw new Error(NO_SWING);
+    try { await native('release'); } catch (e) { /* fine */ }
+    unbusy();
+    await finishClip(items, base, dur, capped);
+  } catch (e) {
+    if (e && e.message === 'cancel') { unbusy(); return; }
+    busy(e && e.message === NO_SWING ? 'We couldn’t find a swing' : 'Couldn’t analyze this video', '', 0, [
+      ['Film again', () => { unbusy(); processNative(true); }, true],
+      ['Pick another', () => { unbusy(); processNative(false); }]]);
+    $('#busyS').textContent = friendly(e); $('#busyS').className = 'err';
+  }
+}
+if (IN_APP) {   // the upload and film buttons open the native picker or camera instead of the browser's file input
+  document.addEventListener('click', e => {
+    const l = e.target.closest && e.target.closest('label[for="fileRec"], label[for="filePick"]');
+    if (!l) return; e.preventDefault(); e.stopPropagation(); processNative(l.getAttribute('for') === 'fileRec');
+  }, true);
+  const r_ = document.getElementById('fileRec'), p_ = document.getElementById('filePick');
+  if (r_) r_.click = () => processNative(true);
+  if (p_) p_.click = () => processNative(false);
 }
 async function processFile(file) {
   if (!file) return;
