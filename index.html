@@ -3109,7 +3109,7 @@ const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const DPR = Math.min(2.5, window.devicePixelRatio || 1);
 // Shown in settings and at the foot of the home screen, so it's always clear which build the phone is running
-const BUILD = 'Version 12, October 30', SW_VER = 'lagline-v12';
+const BUILD = 'Version 13, October 30', SW_VER = 'lagline-v13';
 // A Home Screen app can sit in memory for days. When it comes back to the front, check (with a 1 KB request) whether
 // a newer version has been uploaded, and offer to load it.
 let updAt = 0;
@@ -4393,7 +4393,12 @@ function makeSwing(tr, w, h, base, strict) {
 const TAM_RUN = 'lagline-tam-running', TAM_OFF = 'lagline-tam-off';
 const lsGet = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
 const lsSet = (k, v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) { /* private mode */ } };
-if (lsGet(TAM_RUN)) { lsSet(TAM_OFF, SW_VER); lsSet(TAM_RUN, null); }   // per build: a later build gets to try again
+if (lsGet(TAM_RUN)) { lsSet(TAM_OFF, '1'); lsSet(TAM_RUN, null); }   // for good: a phone that ran out once will again
+// iPhone and iPad Safari give a page far less memory than a computer, and the tracer's models and pictures did not
+// fit even with everything else let go first: the page was closed at "Tracing the club" (versions 11 and 12). On
+// those the detector's own club path is used. Computers and Android phones keep the tracer.
+const IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const tamOn = () => !IOS && !lsGet(TAM_OFF);
 async function freeForTam() {
   try { if (posePromise) { const p = await posePromise; if (p.close) await p.close(); } } catch (e) { posePromise = null; }
   try { if (clubNetP) { const c = await clubNetP; clubNetP = null; await c.sess.release(); } } catch (e) { clubNetP = null; }
@@ -4412,7 +4417,7 @@ function traceAgrees(it) {
   return all >= 8 ? ok / all : null;
 }
 async function tamFor(it, k, n) {
-  if (lsGet(TAM_OFF) === SW_VER) return;
+  if (!tamOn()) return;
   await freeForTam();
   lsSet(TAM_RUN, String(Date.now()));
   // The tracer looks at every few frames; on a fast swing it can lose the club between two looks and follow the mat
@@ -4500,7 +4505,7 @@ async function processFile(file) {
 function saveTiming(tm, w, h, dur, n) {
   const r = x => Math.round(x);
   const txt = `Last video (${w}×${h}, ${dur.toFixed(1)} s, ${n} swing${n > 1 ? 's' : ''}${FRAME_DUR ? `, ${r(1 / FRAME_DUR)} fps` : ''}): ${r(tm.load + tm.scan + tm.body + tm.club)} s in all. ` +
-    `Loading ${r(tm.load)} s, finding swings ${r(tm.scan)} s, body ${r(tm.body)} s for ${tm.nb} frames, club ${r(tm.club)} s` + (lsGet(TAM_OFF) === SW_VER ? ' (light tracer)' : '') + '.';
+    `Loading ${r(tm.load)} s, finding swings ${r(tm.scan)} s, body ${r(tm.body)} s for ${tm.nb} frames, club ${r(tm.club)} s` + (!tamOn() ? ' (light tracer)' : '') + '.';
   lsSet('lagline-timing', txt); showTiming();
 }
 function showTiming() { const el = $('#verSet'); if (!el) return; let t = el.querySelector('.timing'); const txt = lsGet('lagline-timing');
