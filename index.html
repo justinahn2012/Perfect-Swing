@@ -3481,7 +3481,7 @@ const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const DPR = Math.min(2.5, window.devicePixelRatio || 1);
 // Shown in settings and at the foot of the home screen, so it's always clear which build the phone is running
-const BUILD = 'Version 18, October 31', SW_VER = 'lagline-v18';
+const BUILD = 'Version 20, October 31', SW_VER = 'lagline-v20';
 // A Home Screen app can sit in memory for days. When it comes back to the front, check (with a 1 KB request) whether
 // a newer version has been uploaded, and offer to load it.
 let updAt = 0;
@@ -3973,7 +3973,10 @@ let MT_OFF = 0;
 // Each reading can fall short by up to a frame (the frame shown starts a little before the time asked for), so a
 // reading of the same offset again keeps the largest, rather than letting the clock wobble by a frame per seek.
 const learnOffset = o => { if (!isFinite(o)) return; if (Math.abs(o) <= .03) MT_OFF = 0; else if (Math.abs(o - MT_OFF) > .03) MT_OFF = o; else MT_OFF = Math.max(MT_OFF, o); };
-async function playFrames(v, t0, t1, step, rate, onFrame) {
+// grab: called synchronously inside the frame callback, before anything else, to copy the frame the callback is
+// about (once playback is paused and the processing awaited, the element may already show the next frame: at 120 fps
+// that put the picture one frame off its time stamp, which is a 5% club-position error through the downswing)
+async function playFrames(v, t0, t1, step, rate, onFrame, grab) {
   if (!v.requestVideoFrameCallback) return false;
   lastPF = null;
   await seekTo(v, t0);
@@ -3995,11 +3998,13 @@ async function playFrames(v, t0, t1, step, rate, onFrame) {
       // take a frame once it is within a quarter step of the next one wanted (a fixed few-ms slack, counted twice,
       // let a 240 fps Slo-mo through at nearly every frame for a 120 fps step: more frames than planned, and slower)
       if (t >= next - .25 * step) {
+        const late = t - next > step * .5;
+        if (grab && !late) grab(v);
         v.pause();
         inF = true;
         try {
           // a wanted frame went by while playback was restarting: step back for it (one seek) rather than lose it
-          if (t - next > step * .5) { await seekTo(v, next); await onFrame(v.currentTime); next += step; inF = false; arm(); v.play().catch(() => stop(false)); return; }
+          if (late) { await seekTo(v, next); if (grab) grab(v); await onFrame(v.currentTime); next += step; inF = false; arm(); v.play().catch(() => stop(false)); return; }
           await onFrame(t);
         } catch (e) { inF = false; return stop(false, e); }
         inF = false;
@@ -4227,6 +4232,50 @@ function clubNet() {
   })().catch(e => { clubNetP = null; throw e; });
   return clubNetP;
 }
+// the close-up refiner: a tight full-resolution crop (0.3 club lengths wide) round a detector's clubhead candidate,
+// and a small net says where the middle of the head is inside it (and how sure it is that a head is there at all)
+const REFINE_NET = 'refine.onnx', RF_IN = 128, RF_WIN = .30;
+let refineNetP = null;
+function refineNet() {
+  if (!refineNetP) refineNetP = (async () => {
+    const { ort } = await clubNet();
+    const buf = await (await fetch(REFINE_NET, { cache: 'force-cache' })).arrayBuffer();
+    let sess = null;
+    for (const ep of (navigator.gpu ? [['webgpu'], ['wasm']] : [['wasm']])) { try { sess = await ort.InferenceSession.create(buf, { executionProviders: ep }); break; } catch (e) { sess = null; } }
+    if (!sess) throw new Error('no refine net');
+    const cv = document.createElement('canvas'); cv.width = cv.height = RF_IN; const cx = cv.getContext('2d', { willReadFrequently: true });
+    return { ort, sess, cv, cx, inp: new Float32Array(3 * RF_IN * RF_IN) };
+  })().catch(e => { refineNetP = null; throw e; });
+  return refineNetP;
+}
+// src: the video (full resolution, video pixels); (x, y): the candidate; win: crop width in video pixels. A point
+// that wants to move more than 10% of the crop (3% of the club) has jumped to something else (the hosel, the shaft,
+// a shoe): the detector's own point is kept.
+async function refineHead(rn, src, x, y, win, passes) {
+  const { cx, cv, inp, ort, sess } = rn, A = RF_IN * RF_IN, x0 = x, y0 = y; let v = 0;
+  for (let pass = 0; pass < (passes || 2); pass++) {
+    cx.fillStyle = '#727272'; cx.fillRect(0, 0, RF_IN, RF_IN);
+    cx.drawImage(src, x - win / 2, y - win / 2, win, win, 0, 0, RF_IN, RF_IN);
+    const d = cx.getImageData(0, 0, RF_IN, RF_IN).data;
+    for (let i = 0, j = 0; i < A; i++, j += 4) { inp[i] = d[j] / 255; inp[i + A] = d[j + 1] / 255; inp[i + 2 * A] = d[j + 2] / 255; }
+    const out = await sess.run({ [sess.inputNames[0]]: new ort.Tensor('float32', inp, [1, 3, RF_IN, RF_IN]) });
+    const o = out[sess.outputNames[0]].data; x += o[0] * win; y += o[1] * win; v = o[2];
+  }
+  if (Math.hypot(x - x0, y - y0) > .1 * win) { x = x0; y = y0; }
+  return { x, y, v };
+}
+// refine every candidate the detector offered in this frame (the two best heads and the far end of a sure shaft box)
+async function refineDet(rn, src, det, grip, Lc) {
+  const win = RF_WIN * 1.85 * Lc, out = [];
+  for (const [k, h] of det.heads.slice(0, 2).entries()) { const r = await refineHead(rn, src, h.x, h.y, win, k ? 1 : 2); out.push(Object.assign({}, h, r, { x0: h.x, y0: h.y })); }
+  det.heads = out; det.shaftEnd = [];
+  const sh = det.shafts && det.shafts[0];
+  if (sh && sh.s >= .45) {
+    const { a, b } = sh, cs = [[a.x, a.y], [b.x, b.y], [a.x, b.y], [b.x, a.y]], opp = [1, 0, 3, 2];
+    let q = 0; for (let k = 1; k < 4; k++) if (Math.hypot(cs[k][0] - grip.x, cs[k][1] - grip.y) < Math.hypot(cs[q][0] - grip.x, cs[q][1] - grip.y)) q = k;
+    const [x, y] = cs[opp[q]], r = await refineHead(rn, src, x, y, win, 1); det.shaftEnd.push(Object.assign({ s: sh.s * .6, sh: true }, r));
+  }
+}
 // one frame: crop round the grip (2.5 torso lengths each way: the whole club at any point of the swing), detect, and
 // return clubhead candidates and the shaft box in video pixels
 async function clubDetect(net, src, sc, grip, Lt) {
@@ -4277,7 +4326,9 @@ function solveClubNet(track, an, T) {
   if (!Lc) return null;
   // things that never move (a ceiling light, a ball on the mat, a door frame) can look like a clubhead: anything found
   // at the same spot through much of the swing is scenery, and is ignored
-  const still = [], i0 = Math.min(n - 1, P[0] + 1), i9 = n - 1, r0 = .07 * Lc;
+  // (judged only once the club has surely left address, from P2 on: a slow takeaway keeps the real clubhead still for
+  // a dozen frames, and must not be mistaken for scenery; the ball and a lamp are still there after P2, the club is not)
+  const still = [], i0 = Math.min(n - 1, P[1]), i9 = n - 1, r0 = .07 * Lc;
   for (let i = 0; i < n; i++) { const d = dets[i]; if (!d) continue; for (const h of d.heads) {
     let hits = 0, tot = 0; for (let j = i0; j <= i9; j++) { const e = dets[j]; if (!e) continue; tot++; if (e.heads.some(q => Math.hypot(q.x - h.x, q.y - h.y) < r0)) hits++; }
     if (tot > 4 && hits > .18 * tot && !still.some(q => Math.hypot(q.x - h.x, q.y - h.y) < r0)) still.push({ x: h.x, y: h.y }); } }
@@ -4285,8 +4336,15 @@ function solveClubNet(track, an, T) {
   // candidates, as points on screen (the clubhead is followed where it is, not as an offset from wrists that can slip)
   const cand = dets.map((d, i) => {
     const c = []; if (!d) return c;
-    for (const h of d.heads) { if (isStill(h) && i > P[0] + 1) continue; const l = Math.hypot(h.x - sgx[i], h.y - sgy[i]); if (l > .12 * Lc && l < 1.5 * Lc) c.push({ p: [h.x, h.y], s: h.s }); }
-    for (const sh of (d.shafts || [])) {   // a sure shaft box: its corner opposite the hands is where the clubhead is
+    // a candidate the close-up refiner has looked at carries v (how sure it is a clubhead is there): a low v is a
+    // wrong detection and is dropped; a high one counts for more than the detector's own score
+    const sc = h => (h.v == null ? h.s : .5 * h.s + .5 * h.v);
+    // the refiner sits 0.7% of the club short of the middle of the head, along the shaft (consistently, on held-out
+    // clips: it learned partly from outlines that include the hosel): push refined points out along the shaft by that
+    const out7 = (h, l) => (h.v == null || !l ? [h.x, h.y] : [h.x + (h.x - sgx[i]) / l * .007 * Lc, h.y + (h.y - sgy[i]) / l * .007 * Lc]);
+    for (const h of d.heads) { if (h.v != null && h.v < .25) continue; if (isStill(h) && i > P[0] + 1) continue; const l = Math.hypot(h.x - sgx[i], h.y - sgy[i]); if (l > .12 * Lc && l < 1.5 * Lc) c.push({ p: out7(h, l), s: sc(h), r: h.v != null }); }
+    for (const h of (d.shaftEnd || [])) { if (h.v < .25) continue; const l = Math.hypot(h.x - sgx[i], h.y - sgy[i]); if (l > .3 * Lc && l < 1.4 * Lc && !c.some(q => Math.hypot(q.p[0] - h.x, q.p[1] - h.y) < .15 * Lc)) c.push({ p: [h.x, h.y], s: sc(h), sh: true, r: true }); }
+    for (const sh of (d.shaftEnd ? [] : d.shafts || [])) {   // a sure shaft box: its corner opposite the hands is where the clubhead is
       if (sh.s < .45) continue;
       const { a, b } = sh, cs = [[a.x, a.y], [b.x, b.y], [a.x, b.y], [b.x, a.y]], opp = [1, 0, 3, 2]; let best = null;
       for (let q = 0; q < 4; q++) { const n0 = Math.hypot(cs[q][0] - sgx[i], cs[q][1] - sgy[i]); if (n0 > .3 * Lc) continue; const [x, y] = cs[opp[q]], l = Math.hypot(x - sgx[i], y - sgy[i]); if (!best || n0 < best.n0) best = { x, y, l, n0 }; }
@@ -4329,6 +4387,9 @@ function solveClubNet(track, an, T) {
     return i => { if (!u.length) return null; let j = 0; while (j < u.length && u[j].i < i) j++;
       if (j < u.length && u[j].i === i) return { p: u[j].p, sd: .1 * Lc };
       const a = u[j - 1], b = u[j]; if (!a) return { p: b.p, sd: Lc * (.15 + .05 * (b.i - i)) }; if (!b) return { p: a.p, sd: Lc * (.15 + .05 * (i - a.i)) };
+      // no anchor anywhere near the top: a straight line from address to impact would say "the club stays at the
+      // ball", and every real sighting up by the shoulders would be thrown out. There is no guide there at all.
+      if (a.i <= P[1] && b.i >= P[5]) return null;
       const t = (i - a.i) / (b.i - a.i), ch = Math.hypot(b.p[0] - a.p[0], b.p[1] - a.p[1]);
       return { p: [a.p[0] + (b.p[0] - a.p[0]) * t, a.p[1] + (b.p[1] - a.p[1]) * t], sd: .12 * Lc + 1.1 * t * (1 - t) * ch }; }; };
   const run = (G, wPri) => {
@@ -4378,7 +4439,25 @@ function solveClubNet(track, an, T) {
   // smooth the picks and fill the gaps; firm while the club is slow, loose through the strike
   const px = pick.map(q => (q.k >= 0 ? q.d[0] : null)), py = pick.map(q => (q.k >= 0 ? q.d[1] : null)), w = pick.map(q => (q.k >= 0 ? .4 + Math.min(1, q.s) : 0));
   const lam = px.map((_, i) => { const v = Math.max(vPh[ph(i)], .03); return [20, .004, .004, .0015, .003, .05][ph(i)] / (v * v); });
-  const sx = whittaker(px, w, lam, 2, .05 * Lc), sy = whittaker(py, w, lam, 2, .05 * Lc);
+  let sx = whittaker(px, w, lam, 2, .05 * Lc), sy = whittaker(py, w, lam, 2, .05 * Lc);
+  // Then, where readings sit close to that path, the output comes from the readings themselves: a weighted local
+  // quadratic through the close readings of the neighbouring frames (a club moves on a curve, and a straight-line or
+  // acceleration penalty pulls the top of the arc inward). Readings far from the path are the wrong thing and stay out.
+  { const qx = new Array(n).fill(null), qy = new Array(n).fill(null), qw = new Array(n).fill(0);
+    for (let q = 0; q < n; q++) { const near = cand[q].filter(c => Math.hypot(c.p[0] - sx[q], c.p[1] - sy[q]) < .03 * Lc); if (!near.length) continue;
+      let X = 0, Y = 0, W = 0; for (const c of near) { const ww = Math.max(.1, c.s); X += c.p[0] * ww; Y += c.p[1] * ww; W += ww; }
+      qx[q] = X / W; qy[q] = Y / W; qw[q] = .4 + Math.min(1, near[0].s); if (pick[q].k < 0) pick[q] = { k: 0, d: [qx[q], qy[q]], s: near[0].s, snap: true }; }
+    const hw = T.length > 1 && (T[T.length - 1] - T[0]) / (T.length - 1) < 1 / 45 ? 3 : 2;   // half-window: 7 frames at 120 fps, 5 at 30
+    for (let q = 0; q < n; q++) { if (qx[q] == null) continue;
+      const S = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], bx = [0, 0, 0], by = [0, 0, 0]; let m = 0;
+      for (let r = Math.max(0, q - hw); r <= Math.min(n - 1, q + hw); r++) { if (qx[r] == null) continue; const t = r - q, ww = qw[r], f = [1, t, t * t]; m++;
+        for (let a = 0; a < 3; a++) { bx[a] += ww * f[a] * qx[r]; by[a] += ww * f[a] * qy[r]; for (let b2 = 0; b2 < 3; b2++) S[a][b2] += ww * f[a] * f[b2]; } }
+      if (m < 4) { sx[q] = qx[q]; sy[q] = qy[q]; continue; }
+      // solve the 3x3 (Cramer) for the constant term: the fitted position at this frame
+      const det3 = M => M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1]) - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0]) + M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+      const D0 = det3(S); if (Math.abs(D0) < 1e-9) { sx[q] = qx[q]; sy[q] = qy[q]; continue; }
+      const rep = (M, col) => M.map((row, i) => row.map((v, j) => (j === 0 ? col[i] : v)));
+      sx[q] = det3(rep(S, bx)) / D0; sy[q] = det3(rep(S, by)) / D0; } }
   // gaps (blurred frames): a smooth Hermite curve through the neighbouring picks, the way the published trackers
   // fill them, so a gap never balloons out into the room
   const fx = sx.slice(), fy = sy.slice(), idxs = []; for (let q = 0; q < n; q++) if (pick[q].k >= 0) idxs.push(q);
@@ -4401,13 +4480,15 @@ function solveClubNet(track, an, T) {
       miss = pick[q].k < 0 ? miss + 1 : 0;
       if (miss >= 3 || jump || far) { for (let r = q; r < n; r++) out[r] = null; break; } } }
   const i1 = Math.min(P[0], n - 1);
-  // at address the detector's point sits toward the heel (where the shaft enters the head), consistently: measured
-  // against 44 hand-tapped address frames it is 1.6% of the club short along the shaft and 0.5% to the heel side.
-  // Shift it to the middle of the clubface (down the line; face-on gets the along-the-shaft part only).
-  if (Lc) for (let q = 0; q <= i1; q++) { const o = out[q]; if (!o) continue;
+  // at address the detector's point sits toward the heel (where the shaft enters the head): against 101 hand-tapped
+  // address frames from six clips it is short of the middle of the head by 0.2-1.6% of the club along the shaft
+  // (steady within a clip, different between clips) and 0.5-1.5% to the heel side. Shift by the middle of those
+  // (down the line; face-on gets the along-the-shaft part only); the close-up refiner takes out the rest.
+  const refined = dets.some(d => d && d.heads.some(h => h.v != null));   // (refined points are already the middle of the head)
+  if (Lc && !refined) for (let q = 0; q <= i1; q++) { const o = out[q]; if (!o) continue;
     const ux = o.hx - o.gx, uy = o.hy - o.gy, l = Math.hypot(ux, uy) || 1, ax = ux / l, ay = uy / l;
-    const perp = an.view === 'DTL' ? (an.hand === 'L' ? .005 : -.005) * Lc : 0;
-    o.hx += .016 * Lc * ax - perp * ay; o.hy += .016 * Lc * ay + perp * ax; }
+    const perp = an.view === 'DTL' ? (an.hand === 'L' ? .009 : -.009) * Lc : 0;
+    o.hx += .006 * Lc * ax - perp * ay; o.hy += .006 * Lc * ay + perp * ax; }
   const head0 = out[i1] ? { x: out[i1].hx, y: out[i1].hy } : pA ? { x: pA[0], y: pA[1] } : null;
   return { frames: out, head0, quality: good / n, net: true };
 }
@@ -4715,8 +4796,13 @@ async function trackWindow(v, pose, w, h, win, fmax, onFrame) {
   const gctx = grab.getContext('2d', { willReadFrequently: true }), lm = [], wl = [], frames = [], club = []; let found = 0, Lc = 0, prevClub = null;
   const got = [];
   let net = null; try { net = await clubNet(); } catch (e) { net = null; }
-  const one = async (t, j) => {
-    gctx.drawImage(v, 0, 0, fw, fh); got.push(t);
+  let rnet = null; if (net) { try { rnet = await refineNet(); } catch (e) { rnet = null; } }
+  // the close-up refiner looks at the frame at full resolution: a copy taken at the same instant as the small one
+  const full = rnet ? document.createElement('canvas') : null; if (full) { full.width = w; full.height = h; }
+  const fctx = full ? full.getContext('2d', { willReadFrequently: true }) : null;
+  const grabNow = () => { gctx.drawImage(v, 0, 0, fw, fh); if (fctx) fctx.drawImage(v, 0, 0, w, h); };
+  const one = async (t, j, grabbed) => {
+    if (!grabbed) grabNow(); got.push(t);
     const [r, jpg] = await Promise.all([pose.send(grab), toJpeg(grab)]);
     frames.push(jpg);
     if (r && r.poseLandmarks && r.poseWorldLandmarks) {
@@ -4726,13 +4812,13 @@ async function trackWindow(v, pose, w, h, win, fmax, onFrame) {
       // at 60 fps and up, neighbouring frames are nearly the same picture: the detector looks at every other one
       // (the club path search steps over the rest), which takes a third or more off tracking a slow-motion clip
       if (net && c && step < 1 / 45 && j % 2) c.skip = true;
-      else if (net && c) { try { c.det = await clubDetect(net, grab, fsc, gripOf(f), Lc); } catch (e) { /* keep the line finder's reading */ } }
+      else if (net && c) { try { c.det = await clubDetect(net, grab, fsc, gripOf(f), Lc); if (rnet && c.det) await refineDet(rnet, full, c.det, gripOf(f), Lc); } catch (e) { /* keep the line finder's reading */ } }
       if (c && c.ok && prevClub && prevClub.ok) { let d = c.ang - prevClub.ang; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; c.dAng = d; }
       club.push(c); if (c && c.ok) prevClub = c; else if (prevClub) prevClub = Object.assign({}, prevClub, { ok: club.slice(-3).some(x => x && x.ok), dAng: 0 });
     } else { lm.push(null); wl.push(null); club.push(null); }
     onFrame(j, times.length);
   };
-  let ok = await playFrames(v, win.t0, win.t1, step, step < 1 / 45 ? 1 : 1.5, t => one(t, got.length));   // 1.5x: rarely skips a frame (and steps back when it does)
+  let ok = await playFrames(v, win.t0, win.t1, step, step < 1 / 45 ? 1 : 1.5, t => one(t, got.length, true), grabNow);   // 1.5x: rarely skips a frame (and steps back when it does)
   // playback said it was done but the frames stop well short of the end (frame times that ran ahead): fetch the rest
   if (ok === true && got.length && got[got.length - 1] < win.t1 - .02 - 3 * step) ok = false;
   if (ok !== true) {   // fallback: seek to each remaining frame
