@@ -670,6 +670,17 @@ button, .btn, .chip, .pchip, label { touch-action: manipulation; }
 .dst-pic { position: relative; aspect-ratio: 4 / 3; background: #070d0c; }
 .dst-pic canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
 .dst-v { position: absolute; left: 10px; bottom: 8px; font-size: 12px; color: rgba(238,241,234,.7); background: rgba(11,18,16,.7); padding: 3px 8px; border-radius: 99px; }
+/* estimates: measured from one camera but not yet checked against a two-camera reference */
+.est-tag { display: inline-block; font-size: 10.5px; line-height: 16px; padding: 0 6px; border-radius: 99px; border: 1px solid rgba(226, 238, 230, .22); color: var(--fg3); font-weight: 500; vertical-align: 1px; letter-spacing: 0; }
+.prow.est .nm > span, .prow.est .v { color: var(--fg3); }
+.prow.est .bar { opacity: .45; }
+.prow.est .me { background: var(--fg3); }
+.est-note { margin: 10px 14px 4px; }
+.pill.est b { color: var(--fg2); }
+.pill.est small { font-size: 10.5px; color: var(--fg3); }
+.cs-hero.est { background: rgba(255, 255, 255, .04); border-color: var(--line); }
+.verdict b.est { color: var(--fg); }
+.cs-hero.est .cs-hero-n span { color: var(--fg2); }
 </style>
 </head>
 <body>
@@ -1850,7 +1861,12 @@ function analyze(src) {
   const spine = lm.map((f, i) => Math.atan2(ms[i].x - mh[i].x, mh[i].y - ms[i].y) * R2D);
   const leadArm = lm.map(f => Math.atan2(-(f[15].x - f[11].x), f[15].y - f[11].y) * R2D);
   const lElb = wl.map(f => ang3(f[11], f[13], f[15])), tElb = wl.map(f => ang3(f[12], f[14], f[16]));
-  const lKnee = wl.map(f => ang3(f[23], f[25], f[27])), tKnee = wl.map(f => ang3(f[24], f[26], f[28]));
+  // knees: down the line the leg is side-on to the camera, so the flat picture shows the bend as it is (within 1-2°
+  // of a two-camera check on 3 swings); the tracker's depth guess was 4-10° off there. Face-on the bend points at the
+  // camera and only the depth guess has it (still unverified)
+  const ang2 = (p, q, r) => ang3({ x: p.x, y: p.y, z: 0 }, { x: q.x, y: q.y, z: 0 }, { x: r.x, y: r.y, z: 0 });
+  const lKnee = view === 'DTL' ? lm.map(f => ang2(f[23], f[25], f[27])) : wl.map(f => ang3(f[23], f[25], f[27]));
+  const tKnee = view === 'DTL' ? lm.map(f => ang2(f[24], f[26], f[28])) : wl.map(f => ang3(f[24], f[26], f[28]));
   const head = lm.map(f => { const e = mid(f[7], f[8]); return { x: (e.x * 2 + f[0].x) / 3, y: (e.y * 2 + f[0].y) / 3 }; });
   const headX = head.map(p => toIn(p.x - head[i1].x)), headY = head.map(p => toIn(head[i1].y - p.y));
   const hipX = mh.map(p => toIn(p.x - mh[i1].x)), hipY = mh.map(p => toIn(mh[i1].y - p.y));
@@ -1969,28 +1985,29 @@ function findFaults(a) {
     measure: `Hips shift ${f1(sl)} in toward the target by impact. Tour players move about ${drv ? '3–7 in with a driver' : '5–9 in with an iron'}.`,
     why: 'Too much slide and not enough turn leaves the club behind you and the face open.',
     drill: { name: 'Bump then turn', steps: ['Put an alignment stick upright outside your lead hip.', 'Bump into it gently, then rotate away from it.', 'Feel the lead hip turn back behind you.'] } });
+  const ok = key => !unverified(view, key);
   const s4 = at(a, 'sh', 3);
-  if (s4 < 72) push({ id: 'shortTurn', sev: s4 < 60 ? 3 : 2, title: 'Restricted shoulder turn', p: 3, layer: 'angles',
+  if (ok('sh') && s4 < 72) push({ id: 'shortTurn', sev: s4 < 60 ? 3 : 2, title: 'Restricted shoulder turn', p: 3, layer: 'angles',
     measure: `Shoulders turn ${s4.toFixed(0)}° at the top. Tour players turn about 90–105° (Jon Rahm, famously compact, about 75°).`,
     why: 'A short turn shortens the arc and invites the arms to take over the downswing.',
     drill: { name: 'Back to the target', steps: ['Cross your arms over your chest in posture.', 'Turn until your back faces the target.', 'Let the trail hip go back and the lead knee move in.'] } });
   const h4 = at(a, 'hp', 3), x4 = at(a, 'xf', 3);
-  if (h4 > 58 && x4 < 32) push({ id: 'overHip', sev: 1, title: 'Hips over-turn going back', p: 3, layer: 'angles',
+  if (ok('hp') && ok('xf') && h4 > 58 && x4 < 32) push({ id: 'overHip', sev: 1, title: 'Hips over-turn going back', p: 3, layer: 'angles',
     measure: `Hips turn ${h4.toFixed(0)}° with only ${x4.toFixed(0)}° of separation from the shoulders.`,
     why: 'When the hips go with the shoulders, there is less stretch to unwind from.',
     drill: { name: 'Stable trail knee', steps: ['Hold a ball between your knees.', 'Turn to the top without dropping it.', 'Feel the trail knee keep its flex.'] } });
   const le4 = at(a, 'lElb', 3);
-  if (le4 < 132) push({ id: 'bentLead', sev: le4 < 118 ? 2 : 1, title: 'Lead arm collapses at the top', p: 3, layer: 'angles',
+  if (ok('lElb') && le4 < 132) push({ id: 'bentLead', sev: le4 < 118 ? 2 : 1, title: 'Lead arm collapses at the top', p: 3, layer: 'angles',
     measure: `Lead elbow bends to ${le4.toFixed(0)}° at the top. On video, tour players read about 135–155°.`,
     why: 'A folding lead arm shrinks the arc and makes the club length change from swing to swing.',
     drill: { name: 'Wide takeaway', steps: ['Hinge the club to 9 o’clock with the lead arm straight.', 'Push the hands away from your chest as you turn.', 'Stop at the top and check the elbow.'] } });
   const le8 = at(a, 'lElb', 7);
-  if (le8 < 132) push({ id: 'chicken', sev: le8 < 115 ? 3 : 2, title: 'Chicken wing', p: 7, layer: 'angles',
+  if (ok('lElb') && le8 < 132) push({ id: 'chicken', sev: le8 < 115 ? 3 : 2, title: 'Chicken wing', p: 7, layer: 'angles',
     measure: `Lead elbow folds to ${le8.toFixed(0)}° just after impact.`,
     why: 'The lead arm bends instead of rotating, which adds loft and opens the face.',
     drill: { name: 'Towel under the lead arm', steps: ['Tuck a towel under your lead armpit.', 'Hit half shots and keep it there until the club is past your trail leg.', 'Feel the lead forearm rotate over.'] } });
   const h7 = at(a, 'hp', 6);
-  if (h7 > -25) push({ id: 'hipStall', sev: h7 > -14 ? 2 : 1, title: 'Hips stall at impact', p: 6, layer: 'angles',
+  if (ok('hp') && h7 > -25) push({ id: 'hipStall', sev: h7 > -14 ? 2 : 1, title: 'Hips stall at impact', p: 6, layer: 'angles',
     measure: `Hips are only ${Math.max(0, -h7).toFixed(0)}° open at impact. Tour players are about 30–45° open.`,
     why: 'When the hips stop, the arms and hands have to flip to square the face.',
     drill: { name: 'Belt buckle to target', steps: ['Make slow swings to impact.', 'Freeze with the belt buckle facing left of the ball.', 'Repeat with a ball, holding the finish.'] } });
@@ -2038,19 +2055,20 @@ function ottMeasure(a) {
 function strengths(a) {
   const S = [], ids = new Set(a.faults.map(f => f.id));
   if (a.tempo >= 2.7 && a.tempo <= 3.4) S.push('Tour-like tempo');
-  if (at(a, 'sh', 3) >= 90) S.push('Full shoulder turn');
-  if (at(a, 'lElb', 3) >= 155) S.push('Wide lead arm');
+  const ok = key => !unverified(a.view, key);
+  if (ok('sh') && at(a, 'sh', 3) >= 90) S.push('Full shoulder turn');
+  if (ok('lElb') && at(a, 'lElb', 3) >= 155) S.push('Wide lead arm');
   if (a.view === 'DTL' && !ids.has('ee') && !ids.has('posture')) S.push('Holds posture');
   if (a.view === 'FO' && !ids.has('sway') && !ids.has('headDrift')) S.push('Centered pivot');
-  if (a.seqInfo.ordered) S.push('Clean sequence');
-  if (at(a, 'hp', 6) <= -30) S.push('Hips open at impact');
+  if (ok('seq') && a.seqInfo.ordered) S.push('Clean sequence');
+  if (ok('hp') && at(a, 'hp', 6) <= -30) S.push('Hips open at impact');
   return S;
 }
 function scoreOf(a) {
   let s = 100;
   for (const f of a.faults) s -= [0, 4, 8, 14][f.sev];
   s -= Math.min(12, Math.abs(a.tempo - 3) * 6);
-  if (!a.seqInfo.ordered) s -= 4;
+  if (!unverified(a.view, 'seq') && !a.seqInfo.ordered) s -= 4;
   return Math.round(Math.max(30, Math.min(98, s)));
 }
 
@@ -2073,8 +2091,15 @@ const VIEW_METRICS = {
   FO: ['sh', 'hp', 'xf', 'spine', 'leadArm', 'lElb', 'tElb', 'lKnee', 'tKnee', 'hipX', 'headX'],
   DTL: ['sh', 'hp', 'xf', 'spine', 'lElb', 'tElb', 'lKnee', 'tKnee', 'hipX', 'headY']
 };
+// Measures not yet checked against a two-camera reference, or checked and found off (Oct 2026: shoulder and hip turn,
+// X-factor and both elbows were 10-20°+ off from either camera; face-on knees ~20°; the kinematic sequence is built
+// from the turns). They are still shown, greyed as estimates, but nothing is judged on them: no faults, strengths,
+// scores, pro matching or drill suggestions. Take a key out of here once a check says it is right.
+const UNVERIFIED = { FO: new Set(['sh', 'hp', 'xf', 'lElb', 'tElb', 'lKnee', 'tKnee', 'seq']), DTL: new Set(['sh', 'hp', 'xf', 'lElb', 'tElb', 'seq']) };
+const unverified = (view, key) => !!(UNVERIFIED[view] && UNVERIFIED[view].has(key));
+const verifiedKeys = view => VIEW_METRICS[view].filter(k => !unverified(view, k));
 function matchScore(a, b) {
-  const keys = VIEW_METRICS[a.view], perP = [];
+  const keys = verifiedKeys(a.view), perP = [];
   for (let k = 0; k < 10; k++) {
     let s = 0;
     for (const key of keys) { const d = (at(a, key, k) - at(b, key, k)) / METRICS[key].sigma; s += d * d; }
@@ -2127,7 +2152,7 @@ const STYLE = [
 ];
 const styleVal = (a, s) => s.key === 'tempo' ? a.tempo : at(a, s.key, s.p);
 function resemblance(a) {
-  const traits = STYLE.filter(s => !s.view || s.view === a.view);
+  const traits = STYLE.filter(s => (!s.view || s.view === a.view) && !unverified(a.view, s.key));
   const rows = PROS.map(p => {
     const b = proRun(p.id, a.view, a.clubKind).an;
     let d = 0; for (const s of traits) { const z = (styleVal(a, s) - styleVal(b, s)) / s.sigma; d += z * z; }
@@ -2255,7 +2280,7 @@ function findSwings(samples, dur) {
   });
   return wins;
 }
-return { setFinExt: v => { FIN_EXT = v; }, keyVals, hasCap, capSwing, proModel, clubParams, mono, rootFlaw, LEADS, scanSample, findSwings, mirrorFrame, ang3, mid, d2, proj3, PROS, DEMO, BASE, buildSwing, projectModel, analyze, proRun, ranges, matchScore, resemblance, idxAt, METRICS, VIEW_METRICS, P_NAMES, P_SHORT, P_PHASE, PF, CAM, IN_PER_TORSO, at };
+return { setFinExt: v => { FIN_EXT = v; }, keyVals, hasCap, capSwing, proModel, clubParams, mono, rootFlaw, LEADS, scanSample, findSwings, mirrorFrame, ang3, mid, d2, proj3, PROS, DEMO, BASE, buildSwing, projectModel, analyze, proRun, ranges, matchScore, resemblance, idxAt, METRICS, VIEW_METRICS, unverified, verifiedKeys, P_NAMES, P_SHORT, P_PHASE, PF, CAM, IN_PER_TORSO, at };
 })();
 if (typeof module !== 'undefined') module.exports = LG;
 
@@ -3481,7 +3506,7 @@ const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const DPR = Math.min(2.5, window.devicePixelRatio || 1);
 // Shown in settings and at the foot of the home screen, so it's always clear which build the phone is running
-const BUILD = 'Version 23, October 31', SW_VER = 'lagline-v23';
+const BUILD = 'Version 24, October 31', SW_VER = 'lagline-v24';
 // A Home Screen app can sit in memory for days. When it comes back to the front, check (with a 1 KB request) whether
 // a newer version has been uploaded, and offer to load it.
 let updAt = 0;
@@ -5460,7 +5485,7 @@ function drawAnalysis() {
   const k = curP(an, i), onP = k >= 0 && an.P[k] === i;
   let hl = '';
   if (pr) hl += `<button type="button" class="pill flag rmpro" data-rmpro="1" aria-label="Stop comparing with ${proName(S.proId)}">vs ${proName(S.proId)}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M7 7l10 10M17 7 7 17"/></svg></button>`;
-  if (L.angles) hl += `<span class="pill">Shoulders <b>${fmt('sh', an.m.sh[i])}</b></span><span class="pill">Hips <b>${fmt('hp', an.m.hp[i])}</b></span>`;
+  if (L.angles) hl += `<span class="pill${isEst(an.view, 'sh') ? ' est' : ''}">Shoulders <b>${fmt('sh', an.m.sh[i])}</b>${isEst(an.view, 'sh') ? '<small>est.</small>' : ''}</span><span class="pill${isEst(an.view, 'hp') ? ' est' : ''}">Hips <b>${fmt('hp', an.m.hp[i])}</b>${isEst(an.view, 'hp') ? '<small>est.</small>' : ''}</span>`;
   if (scale() > 1.01) hl += `<span class="pill">Slo-mo</span>`;
   $('#hudL').innerHTML = hl;
   if (pr && S.mode === 'side') {
@@ -5592,7 +5617,7 @@ function renderConsistency(items, cur) {
   const rows = [
     ['tempo', 'Tempo', null], ['sh', 'Shoulder turn at the top', 3], [view === 'FO' ? 'hp' : 'hipX', view === 'FO' ? 'Hip turn at impact' : 'Hip depth at impact', 6],
     ['headX', 'Head drift at the top', 3], ['score', 'Swing score', null]
-  ];
+  ].map(r => !isEst(view, r[0]) ? r : r[0] === 'sh' ? (view === 'FO' ? ['leadArm', 'Arm height at the top', 3] : ['spine', 'Spine angle at impact', 6]) : ['hipX', 'Hip sway at the top', 3]);
   const val = (x, key, k) => key === 'tempo' ? x.an.tempo : key === 'score' ? x.an.score : LG.at(x.an, key, k);
   const txt = (key, v) => key === 'score' ? String(Math.round(v)) : fmtAny(key, v, view);
   const out = rows.map(([key, lab, k]) => {
@@ -5779,16 +5804,16 @@ function renderPositions() {
     const all = [lo, hi, v].concat(pv == null ? [] : [pv]).map(gf);
     let mn = Math.min(...all), mx = Math.max(...all); const pad = (mx - mn) * .12 || 1; mn -= pad; mx += pad;
     const X0 = x => 100 * (gf(x) - mn) / (mx - mn), X = x => X0(x).toFixed(1);
-    const out = v < lo || v > hi;
+    const est = isEst(view, key), out = !est && (v < lo || v > hi);
     const [lab, sub] = metricLabel(key, view);
     const midR = (lo + hi) / 2;
-    const dir = verdictOf(v, cmpTarget(an, key, k));
-    rows += `<button type="button" class="prow tap" data-coach="${key}" data-k="${k}" aria-label="${lab}: what it means and how to fix it"><div class="nm"><span>${lab}${sub ? ` <small style="color:var(--fg3);font-size:11px">${sub}</small>` : ''}</span><div class="bar"><i class="band" style="left:${Math.min(X0(lo), X0(hi)).toFixed(1)}%;width:${Math.abs(X0(hi) - X0(lo)).toFixed(1)}%"></i>${pv != null ? `<i class="pr" style="left:${X(pv)}%"></i>` : `<i class="mid" style="left:${X(midR)}%"></i>`}<i class="me${out ? ' out' : ''}" style="left:${X(v)}%"></i></div></div>
+    const dir = est ? 'ok' : verdictOf(v, cmpTarget(an, key, k));
+    rows += `<button type="button" class="prow tap${est ? ' est' : ''}" data-coach="${key}" data-k="${k}" aria-label="${lab}: what it means and how to fix it"><div class="nm"><span>${lab}${sub ? ` <small style="color:var(--fg3);font-size:11px">${sub}</small>` : ''}${est ? ' ' + EST_TAG : ''}</span><div class="bar"><i class="band" style="left:${Math.min(X0(lo), X0(hi)).toFixed(1)}%;width:${Math.abs(X0(hi) - X0(lo)).toFixed(1)}%"></i>${pv != null ? `<i class="pr" style="left:${X(pv)}%"></i>` : `<i class="mid" style="left:${X(midR)}%"></i>`}<i class="me${out ? ' out' : ''}" style="left:${X(v)}%"></i></div></div>
       <div class="v">${fmt(key, v, view)}</div><div class="v pro${pv != null ? '' : ' mid'}">${pv != null ? fmt(key, pv, view) : fmt(key, midR, view)}<small>${pv != null ? '' : 'tour mid'}</small></div><i class="chev ${dir === 'ok' ? '' : 'off'}" aria-hidden="true"></i></button>`;
   }
   $('#posBody').innerHTML = `<div class="ptable"><div class="ph"><h3>P${k + 1} <span class="pn">${LG.P_NAMES[k]}</span></h3><span>${match != null ? `${match}% match` : ''}</span></div>
     <div class="prow head"><span>Measure</span><span>You</span><span>${pr ? proName(S.proId).split(' ')[0] : 'Tour'}</span><span></span></div>${rows}
-    <div class="legend"><span><i style="background:rgba(94,211,154,.4)"></i>Tour range</span>${pr ? `<span><i style="background:var(--flag)"></i>${proName(S.proId)}</span>` : '<span><i style="background:var(--mid)"></i>Tour middle</span>'}<span><i style="background:var(--fg)"></i>You</span></div></div>`;
+    <div class="legend"><span><i style="background:rgba(94,211,154,.4)"></i>Tour range</span>${pr ? `<span><i style="background:var(--flag)"></i>${proName(S.proId)}</span>` : '<span><i style="background:var(--mid)"></i>Tour middle</span>'}<span><i style="background:var(--fg)"></i>You</span></div>${keys.some(kk => isEst(view, kk)) ? `<p class="fine est-note">Greyed rows are estimates. From one camera they can be well off (we checked them against swings filmed from two angles at once), so they don't count toward faults, your score or pro matching yet.</p>` : ''}</div>`;
 }
 function renderFaults() {
   const an = S.cur.an;
@@ -5816,8 +5841,8 @@ function renderSequence() {
     <div class="seqcard"><div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px"><b style="font-size:15px">Kinematic sequence</b><span style="font-size:12px;color:var(--fg3)">top → finish</span></div>
       <canvas class="seqcv" id="seqCv"></canvas>
       <div class="order">${order.map((o, n) => `${n ? '<em>→</em>' : ''}<span style="color:${cols[o.j]}">${names[o.j]}</span>`).join('')}</div>
-      <p class="verdict">${si.ordered ? '<b>Efficient order.</b> Speed builds from the ground up: pelvis, then chest, then arms, then hands.' : '<b class="no">Out of order.</b> Tour swings peak pelvis first and hands last. Here something upstream peaks late, which usually means the arms are doing the work.'}</p>
-      ${si.ordered ? '' : `<div class="dlist">${['step-drill', 'pump-drill', 'pause-top'].map(drillCard).join('')}</div>`}
+      <p class="verdict">${isEst(an.view, 'seq') ? `<b class="est">Estimate only.</b> The pelvis and chest speeds come from hip and shoulder turn, which one camera can't yet measure reliably, so this order is a rough guide and isn't scored.` : si.ordered ? '<b>Efficient order.</b> Speed builds from the ground up: pelvis, then chest, then arms, then hands.' : '<b class="no">Out of order.</b> Tour swings peak pelvis first and hands last. Here something upstream peaks late, which usually means the arms are doing the work.'}</p>
+      ${si.ordered || isEst(an.view, 'seq') ? '' : `<div class="dlist">${['step-drill', 'pump-drill', 'pause-top'].map(drillCard).join('')}</div>`}
       <div class="legend" style="border:0;padding:0">${names.map((n, j) => `<span><i style="background:${cols[j]}"></i>${n} ${Math.round(si.vals[j] * (j === 3 ? sc : sc))}${units[j]}</span>`).join('')}</div>
       <p class="fine">Estimated from body landmarks${an.src.synthetic ? '' : ' at the clip’s frame rate; slo-mo gives cleaner curves'}.</p></div></div>`;
   drawSeqChart();
@@ -5959,6 +5984,8 @@ const DR = COACH.DRILLS;
 const firstName = id => (id ? proName(id).split(' ')[0] : '');
 const LAYER_FOR = { sh: 'angles', hp: 'angles', xf: 'angles', lElb: 'angles', tElb: 'angles', lKnee: 'angles', tKnee: 'angles', leadArm: 'angles', spine: 'lines', hipX: 'lines', headX: 'head', headY: 'head', tempo: 'path' };
 const UNIT = key => (key === 'hipX' || key === 'headX' || key === 'headY') ? ' in' : key === 'tempo' ? '' : '°';
+const isEst = (view, key) => key !== 'tempo' && key !== 'score' && LG.unverified(view, key);   // measured, but not yet checked against a two-camera reference: shown greyed, never judged
+const EST_TAG = '<small class="est-tag">estimate</small>';
 function fmtAny(key, v, view) { return key === 'tempo' ? v.toFixed(1) + ':1' : fmt(key, v, view); }
 const openAxis = (key, hi) => (key === 'sh' || key === 'hp') && hi < 0;
 function rangeTx(key, lo, hi, view) {
@@ -6363,7 +6390,7 @@ function heroVal(key, v, view) {
 }
 function openCoach(key, k) {
   const it = S.cur; if (!it) return;
-  const an = it.an, view = an.view, u = userVal(an, key, k), tg = cmpTarget(an, key, k), dir = verdictOf(u, tg);
+  const an = it.an, view = an.view, u = userVal(an, key, k), tg = cmpTarget(an, key, k), est = isEst(view, key), dir = est ? 'ok' : verdictOf(u, tg);
   const e = (dir === 'ok' ? COACH.okText(key, k) : COACH.entry(key, k, view, dir)) || COACH.okText(key, k);
   const extra = { you: fmtAny(key, u, view), target: fmtAny(key, tg.val, view) };
   const F = s => fillText(s, tg.who, extra), m = COACH.M[key];
@@ -6374,19 +6401,19 @@ function openCoach(key, k) {
   const all = [tg.rlo, tg.rhi, u, tg.val].map(gf); let mn = Math.min(...all), mx = Math.max(...all); const pd = (mx - mn) * .14 || 1; mn -= pd; mx += pd;
   const X0 = x => 100 * (gf(x) - mn) / (mx - mn), X = x => X0(x).toFixed(1);
   const gap = Math.abs(u - tg.val), unit = UNIT(key);
-  const gapTx = dir === 'ok' ? `In line with ${tg.isPro ? tg.who : 'the tour range'}` : `${key === 'tempo' ? gap.toFixed(1) : unit === ' in' ? gap.toFixed(1) : Math.round(gap)}${unit} from ${tg.isPro ? tg.who : 'the tour middle'}`;
+  const gapTx = est ? 'Estimate only' : dir === 'ok' ? `In line with ${tg.isPro ? tg.who : 'the tour range'}` : `${key === 'tempo' ? gap.toFixed(1) : unit === ' in' ? gap.toFixed(1) : Math.round(gap)}${unit} from ${tg.isPro ? tg.who : 'the tour middle'}`;
   const hist = historyFor(key, k, view).slice(-8);
   const f = store.get('focus', null), isFocus = f && f.key === key && f.k === k && f.view === view;
   // what the number means comes first: it is what the golfer opened this for; the picture and the numbers back it up
-  $('#csBody').innerHTML = `<section class="cs-hero ${dir === 'ok' ? 'ok' : 'off'}"><h3>${gapTx}</h3><p>${F(e.means)}</p>
+  $('#csBody').innerHTML = `<section class="cs-hero ${est ? 'est' : dir === 'ok' ? 'ok' : 'off'}"><h3>${gapTx}</h3>${est ? `<p>From ${view === 'FO' ? 'face-on' : 'down the line'}, one camera can't measure this reliably yet: checked against swings filmed from two angles at once, it was often 15° or more off. It isn't used for faults, your score or drill suggestions until it passes that check.</p>` : `<p>${F(e.means)}</p>`}
       <div class="cs-hero-n"><span>You <b class="mono">${heroVal(key, u, view)}</b></span><span>${tg.isPro ? tg.who : 'Tour middle'} <b class="mono">${heroVal(key, tg.val, view)}</b></span></div></section>
     ${metricDiagram(key, k)}
     <div class="cs-gauge"><div class="bar big"><i class="band" style="left:${Math.min(X0(tg.rlo), X0(tg.rhi)).toFixed(1)}%;width:${Math.abs(X0(tg.rhi) - X0(tg.rlo)).toFixed(1)}%"></i>${dir === 'ok' ? '' : `<i class="gapl" style="left:${Math.min(X0(u), X0(tg.val)).toFixed(1)}%;width:${Math.abs(X0(u) - X0(tg.val)).toFixed(1)}%"></i>`}${tg.isPro ? `<i class="pr" style="left:${X(tg.val)}%"></i>` : `<i class="mid" style="left:${X(tg.val)}%"></i>`}<i class="me${dir === 'ok' ? '' : ' out'}" style="left:${X(u)}%"></i></div></div>
     <div class="cs-nums"><div><span>You</span><b class="mono">${fmtAny(key, u, view)}</b></div><div><span>${tg.isPro ? tg.who : 'Tour middle'}</span><b class="mono ${tg.isPro ? 'pro' : 'mid'}">${fmtAny(key, tg.val, view)}</b></div><div><span>Tour range</span><b class="mono rng">${rangeTx(key, tg.rlo, tg.rhi, view)}</b></div></div>
-    <section class="cs-sec"><h4>What it does to your shots</h4><p>${F(e.shots)}</p></section>
+    ${est ? '' : `<section class="cs-sec"><h4>What it does to your shots</h4><p>${F(e.shots)}</p></section>
     <section class="cs-sec"><h4>${dir === 'ok' ? 'Keep it' : `How to get closer to ${tg.isPro ? tg.who : 'the tour range'}`}</h4><p>${F(e.fix)}</p></section>
     <section class="cs-sec"><h4>Drills</h4><div class="dlist">${(e.drills || []).map(drillCard).join('') || '<p class="fine">No drill needed here.</p>'}</div>
-      <p class="fine">Do each drill until you get 5 good reps in a row, then film a full swing to re-test.</p></section>
+      <p class="fine">Do each drill until you get 5 good reps in a row, then film a full swing to re-test.</p></section>`}
     <section class="cs-sec"><h4>What this measures</h4><p>${m ? m.what : ''}</p></section>
     <section class="cs-sec"><h4>Your progress</h4>${hist.length >= 2 ? sparkline(hist, tg) + `<p class="fine">Your last ${hist.length} ${view === 'FO' ? 'face-on' : 'down-the-line'} swings on this device. Green is the target zone.</p>` : '<p class="fine">Film a few swings from this angle and your trend shows up here.</p>'}</section>
     <div class="cs-acts">${key !== 'tempo' ? `<button type="button" class="btn" data-showme="${key}" data-k="${k}">Show me at P${k + 1}</button>` : `<button type="button" class="btn" data-drill="tempo-trainer">Open tempo trainer</button>`}
@@ -6538,7 +6565,8 @@ function targetText(d, t) {
   const u = ['hipX', 'headX', 'headY'].includes(d.live.metric) ? ' in' : '°';
   const at = { top: 'at the top', impact: 'at impact', release: 'after impact' }[d.live.pos];
   const op = { min: 'at least', max: 'no more than', absMax: 'within ±', maxRel: 'no more than +' }[t.cmp];
-  return `${nm} ${op}${t.cmp === 'absMax' || t.cmp === 'maxRel' ? '' : ' '}${t.val}${u} ${at}`;
+  const key = d.live.metric === 'hpOpen' ? 'hp' : d.live.metric;
+  return `${nm} ${op}${t.cmp === 'absMax' || t.cmp === 'maxRel' ? '' : ' '}${t.val}${u} ${at}${LG.METRICS[key] && isEst(d.view, key) ? ' (an estimate from one camera)' : ''}`;
 }
 function openDrill(id) {
   const d = DR[id]; if (!d) return; dsId = id;
