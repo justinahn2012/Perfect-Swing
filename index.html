@@ -3481,7 +3481,7 @@ const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const DPR = Math.min(2.5, window.devicePixelRatio || 1);
 // Shown in settings and at the foot of the home screen, so it's always clear which build the phone is running
-const BUILD = 'Version 20, October 31', SW_VER = 'lagline-v20';
+const BUILD = 'Version 22, October 31', SW_VER = 'lagline-v22';
 // A Home Screen app can sit in memory for days. When it comes back to the front, check (with a 1 KB request) whether
 // a newer version has been uploaded, and offer to load it.
 let updAt = 0;
@@ -3777,15 +3777,30 @@ function drawClubPath(g, an, M, i) {
   const P = an.P, D = denseClub(an), H = D.map(ps => ps.map(M));
   const segs = [[P[0], P[3], 'rgba(190,168,255,.95)'], [P[3], P[6], 'rgba(255,128,214,.95)'], [P[6], P[9], 'rgba(235,240,234,.75)']];
   g.lineCap = 'round'; g.lineJoin = 'round';
+  // a stretch the club was not seen in, with clear sightings on both sides, is drawn dashed (the club's path between
+  // the two, estimated) rather than left as a gap; an unseen stretch with nothing after it is still left out
+  const seenAt = c.map(q => !!(q && !q.est)), lastSeen = Math.max(-1, ...seenAt.map((v, j) => (v ? j : -1)));
+  const firstSeen = seenAt.indexOf(true), bridged = j => c[j] && c[j].est && j > firstSeen && j < lastSeen;
   for (const [s0, e, col] of segs) {
     // only where the club was actually seen: a guessed stretch leaves a gap rather than a made-up curve
     const path = (to) => { g.beginPath(); let on = false; for (let j = s0; j <= to; j++) { if (c[j] && c[j].est && !(c[j - 1] && !c[j - 1].est && c[j + 1] && !c[j + 1].est)) { on = false; continue; } const ps = j < to ? H[j] : H[j].slice(0, 1); for (const p of ps) { on ? g.lineTo(p.x, p.y) : g.moveTo(p.x, p.y); on = true; } } g.stroke(); };
-    g.strokeStyle = col; g.globalAlpha = .22; g.lineWidth = 2; path(e);
-    const ee = Math.min(e, i); if (ee > s0) { g.globalAlpha = 1; g.lineWidth = 3; path(ee); }
+    const dashed = (to) => { g.save(); g.setLineDash([5, 6]); g.beginPath();
+      for (let j = s0; j <= to; j++) { if (!bridged(j) || (c[j - 1] && c[j - 1].est && !(c[j - 2] && !c[j - 2].est && c[j] && !c[j].est) && j > s0 && bridged(j - 1) && false)) continue;
+        const pre = H[j - 1] && H[j - 1].length ? H[j - 1][H[j - 1].length - 1] : null, ps = j < to ? H[j] : H[j].slice(0, 1), nx = H[j + 1] && H[j + 1][0];
+        let on = false; if (pre) { g.moveTo(pre.x, pre.y); on = true; }
+        for (const p of ps) { on ? g.lineTo(p.x, p.y) : g.moveTo(p.x, p.y); on = true; }
+        if (nx && j < to) g.lineTo(nx.x, nx.y); }
+      g.stroke(); g.restore(); };
+    g.strokeStyle = col; g.globalAlpha = .22; g.lineWidth = 2; path(e); dashed(e);
+    const ee = Math.min(e, i); if (ee > s0) { g.globalAlpha = 1; g.lineWidth = 3; path(ee); g.globalAlpha = .8; g.lineWidth = 2.5; dashed(ee); }
   }
   g.globalAlpha = 1;
   const q = c[i], gp = M(q.g), hp = M(q.h);
-  if (q.est && !(c[i - 1] && !c[i - 1].est && c[i + 1] && !c[i + 1].est)) return true;   // not seen in this frame: draw no club rather than a guess
+  const single = q.est && c[i - 1] && !c[i - 1].est && c[i + 1] && !c[i + 1].est;
+  if (q.est && !single && !bridged(i)) return true;   // not seen, and nothing seen after it: draw no club rather than a guess
+  if (q.est && !single) {   // estimated between two sightings: a dashed shaft and an open ring, so it reads as a best guess
+    g.save(); g.setLineDash([4, 5]); g.strokeStyle = 'rgba(255,255,255,.7)'; g.lineWidth = 2; seg(g, gp, hp); g.restore();
+    g.strokeStyle = '#C9B8FF'; g.lineWidth = 2.5; g.beginPath(); g.arc(hp.x, hp.y, 5.5, 0, 7); g.stroke(); return true; }
   g.strokeStyle = 'rgba(255,255,255,.85)'; g.lineWidth = 2; seg(g, gp, hp);
   g.fillStyle = '#C9B8FF'; g.beginPath(); g.arc(hp.x, hp.y, 5.5, 0, 7); g.fill(); g.strokeStyle = C.bg; g.lineWidth = 2; g.stroke();
   return true;
@@ -4276,6 +4291,43 @@ async function refineDet(rn, src, det, grip, Lc) {
     const [x, y] = cs[opp[q]], r = await refineHead(rn, src, x, y, win, 1); det.shaftEnd.push(Object.assign({ s: sh.s * .6, sh: true }, r));
   }
 }
+// The clubhead as the outermost moving thing (for frames the detector found nothing in): with the phone still, the
+// club is the fastest-moving thing in the picture. Pixels that differ from both the frame before and the frame after
+// are where something is now; within a ring round the hands (0.35-1.25 club lengths), the moving pixels farthest
+// from the hands are the head. A low-confidence suggestion: the path step keeps it only if it fits the club's motion.
+// a, b, d: grey frames (before, now, after) at w x h; (hx, hy, L): hands and club length in the same pixels.
+function grayOf(ctx, w, h) {
+  const px = ctx.getImageData(0, 0, w, h).data, g = new Uint8Array(w * h), t = new Uint16Array(w * h);
+  for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = (px[j] * 77 + px[j + 1] * 150 + px[j + 2] * 29) >> 8;
+  // 3x3 box blur twice (about a Gaussian): film grain and compression flicker are not motion
+  for (let pass = 0; pass < 2; pass++) {
+    for (let y = 0; y < h; y++) for (let x = 1; x < w - 1; x++) { const i = y * w + x; t[i] = g[i - 1] + g[i] + g[i + 1]; }
+    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) { const i = y * w + x; g[i] = (t[i - w] + t[i] + t[i + w]) / 9; }
+  }
+  return g;
+}
+function motionHead(a, b, d, w, h, hx, hy, L) {
+  const TAU = 18, r0 = .35 * L, r1 = 1.25 * L;
+  const x0 = Math.max(1, Math.floor(hx - r1)), x1 = Math.min(w - 2, Math.ceil(hx + r1)), y0 = Math.max(1, Math.floor(hy - r1)), y1 = Math.min(h - 2, Math.ceil(hy + r1));
+  if (x1 <= x0 || y1 <= y0) return null;
+  const mw = x1 - x0 + 1, m = new Uint8Array(mw * (y1 - y0 + 1)); let ring = 0, mov = 0;
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const r = Math.hypot(x - hx, y - hy); if (r < r0 || r > r1) continue; ring++;
+    const i = y * w + x; if (Math.abs(b[i] - a[i]) > TAU && Math.abs(b[i] - d[i]) > TAU) { m[(y - y0) * mw + (x - x0)] = 1; mov++; }
+  }
+  if (!ring || mov / ring > .25) return null;   // the whole picture moving: a hand-held phone, no motion cue
+  // keep pixels with enough moving neighbours (an opening, roughly), then the farthest from the hands
+  const pts = []; let far = -1, fi = -1;
+  for (let y = y0 + 1; y < y1; y++) for (let x = x0 + 1; x < x1; x++) {
+    const k = (y - y0) * mw + (x - x0); if (!m[k]) continue;
+    const nb = m[k - 1] + m[k + 1] + m[k - mw] + m[k + mw] + m[k - mw - 1] + m[k - mw + 1] + m[k + mw - 1] + m[k + mw + 1]; if (nb < 4) continue;
+    const r = Math.hypot(x - hx, y - hy); pts.push([x, y, r]); if (r > far) { far = r; fi = pts.length - 1; }
+  }
+  if (pts.length < 8) return null;
+  const [fx, fy] = pts[fi]; let X = 0, Y = 0, n = 0;
+  for (const [x, y, r] of pts) if (r > far - .12 * L && Math.hypot(x - fx, y - fy) < .08 * L) { X += x; Y += y; n++; }
+  return n ? { x: X / n, y: Y / n } : null;
+}
 // one frame: crop round the grip (2.5 torso lengths each way: the whole club at any point of the swing), detect, and
 // return clubhead candidates and the shaft box in video pixels
 async function clubDetect(net, src, sc, grip, Lt) {
@@ -4326,12 +4378,16 @@ function solveClubNet(track, an, T) {
   if (!Lc) return null;
   // things that never move (a ceiling light, a ball on the mat, a door frame) can look like a clubhead: anything found
   // at the same spot through much of the swing is scenery, and is ignored
-  // (judged only once the club has surely left address, from P2 on: a slow takeaway keeps the real clubhead still for
-  // a dozen frames, and must not be mistaken for scenery; the ball and a lamp are still there after P2, the club is not)
-  const still = [], i0 = Math.min(n - 1, P[1]), i9 = n - 1, r0 = .07 * Lc;
+  // A real fixture (a lamp, a ball, a door frame) is there from the start of the swing to the end; the clubhead can
+  // linger in one spot only for a stretch (a slow takeaway, a pause at the top). So a spot is scenery only when it is
+  // seen in many frames AND in both the first and the last third of the swing (from P2 on).
+  const still = [], i0 = Math.min(n - 1, P[1]), i9 = n - 1, r0 = .07 * Lc, third = (i9 - i0) / 3;
   for (let i = 0; i < n; i++) { const d = dets[i]; if (!d) continue; for (const h of d.heads) {
-    let hits = 0, tot = 0; for (let j = i0; j <= i9; j++) { const e = dets[j]; if (!e) continue; tot++; if (e.heads.some(q => Math.hypot(q.x - h.x, q.y - h.y) < r0)) hits++; }
-    if (tot > 4 && hits > .18 * tot && !still.some(q => Math.hypot(q.x - h.x, q.y - h.y) < r0)) still.push({ x: h.x, y: h.y }); } }
+    if (still.some(q => Math.hypot(q.x - h.x, q.y - h.y) < r0)) continue;
+    let tot = 0, hits = 0, early = false, late = false;
+    for (let j = i0; j <= i9; j++) { const e = dets[j]; if (!e) continue; tot++;
+      if (e.heads.some(q => Math.hypot(q.x - h.x, q.y - h.y) < r0)) { hits++; if (j < i0 + third) early = true; if (j > i9 - third) late = true; } }
+    if (tot > 4 && hits > .18 * tot && early && late) still.push({ x: h.x, y: h.y }); } }
   const isStill = h => still.some(q => Math.hypot(q.x - h.x, q.y - h.y) < 1.5 * r0);
   // candidates, as points on screen (the clubhead is followed where it is, not as an offset from wrists that can slip)
   const cand = dets.map((d, i) => {
@@ -4475,10 +4531,12 @@ function solveClubNet(track, an, T) {
   for (let q = 0; q < n; q++) out.push({ gx: sgx[q], gy: sgy[q], hx: fx[q], hy: fy[q], est: pick[q].k < 0 || !!pick[q].imp });
   // after impact: the path is drawn only as long as the club is actually being followed; once it is lost (a few
   // frames unseen, or a jump no club makes) the line stops rather than wander off to a lamp or a ball basket
-  { let miss = 0; for (let q = i7 + 1; q < n; q++) {
-      const jump = Math.hypot(out[q].hx - out[q - 1].hx, out[q].hy - out[q - 1].hy) > .55 * Lc, far = Math.hypot(out[q].hx - out[q].gx, out[q].hy - out[q].gy) > 1.3 * Lc;
+  { const dt = n > 1 ? (T[n - 1] - T[0]) / (n - 1) : 1 / 30, missMax = Math.max(3, Math.round(.1 / dt)), jumpMax = .55 * Lc * Math.min(1, dt * 30 * 1.5);
+    let miss = 0; for (let q = i7 + 1; q < n; q++) {
+      if (skip[q]) continue;   // a frame the detector was never asked about is not a frame it missed
+      const jump = Math.hypot(out[q].hx - out[q - 1].hx, out[q].hy - out[q - 1].hy) > Math.max(jumpMax, .2 * Lc), far = Math.hypot(out[q].hx - out[q].gx, out[q].hy - out[q].gy) > 1.3 * Lc;
       miss = pick[q].k < 0 ? miss + 1 : 0;
-      if (miss >= 3 || jump || far) { for (let r = q; r < n; r++) out[r] = null; break; } } }
+      if (miss >= missMax || jump || far) { for (let r = q; r < n; r++) out[r] = null; break; } } }
   const i1 = Math.min(P[0], n - 1);
   // at address the detector's point sits toward the heel (where the shaft enters the head): against 101 hand-tapped
   // address frames from six clips it is short of the middle of the head by 0.2-1.6% of the club along the shaft
@@ -4794,6 +4852,8 @@ async function trackWindow(v, pose, w, h, win, fmax, onFrame) {
   const fsc = Math.min(1, fmax / Math.max(w, h)), fw = Math.round(w * fsc), fh = Math.round(h * fsc);
   const grab = document.createElement('canvas'); grab.width = fw; grab.height = fh;
   const gctx = grab.getContext('2d', { willReadFrequently: true }), lm = [], wl = [], frames = [], club = []; let found = 0, Lc = 0, prevClub = null;
+  const clubSeen = []; let clubL = 0;   // the club's length on screen, from the first clear sightings (address)
+  const greys = new Map(), mk = step < 1 / 45 ? Math.max(1, Math.round(1 / 60 / step)) : 1;   // motion: compare with frames 1/60 s apart
   const got = [];
   let net = null; try { net = await clubNet(); } catch (e) { net = null; }
   let rnet = null; if (net) { try { rnet = await refineNet(); } catch (e) { rnet = null; } }
@@ -4812,7 +4872,25 @@ async function trackWindow(v, pose, w, h, win, fmax, onFrame) {
       // at 60 fps and up, neighbouring frames are nearly the same picture: the detector looks at every other one
       // (the club path search steps over the rest), which takes a third or more off tracking a slow-motion clip
       if (net && c && step < 1 / 45 && j % 2) c.skip = true;
-      else if (net && c) { try { c.det = await clubDetect(net, grab, fsc, gripOf(f), Lc); if (rnet && c.det) await refineDet(rnet, full, c.det, gripOf(f), Lc); } catch (e) { /* keep the line finder's reading */ } }
+      else if (net && c) { try {
+        // the search square is sized from the club itself once it has been seen clearly (the detector was trained on
+        // squares about 2.7 club lengths across); until then from the torso (the club is about 1.85 torsos, but camera
+        // angle can make it look much shorter, and a square too big makes the head too small to find)
+        const g = gripOf(f), Lcrop = clubL ? clubL * 1.35 / 2.5 : Lc;
+        c.det = await clubDetect(net, grab, fsc, g, Lcrop);
+        const h0 = c.det && c.det.heads[0];
+        if (h0 && h0.s > .5 && clubSeen.length < 12) { const l = Math.hypot(h0.x - g.x, h0.y - g.y); if (l > 1.1 * Lc && l < 2.8 * Lc) { clubSeen.push(l); if (clubSeen.length >= 5) clubL = clubSeen.slice().sort((a, b) => a - b)[clubSeen.length >> 1]; } }
+        if (rnet && c.det) await refineDet(rnet, full, c.det, g, clubL ? clubL / 1.85 : Lc);
+      } catch (e) { /* keep the line finder's reading */ } }
+      // motion cue for the frame mk back, now that the frame after it is here (only where the detector found nothing)
+      if (net) { try {
+        const j = lm.length - 1; greys.set(j, grayOf(gctx, fw, fh)); greys.delete(j - 2 * mk - 1);
+        const q = j - mk, cq = club[q], fq = lm[q];
+        if (q >= mk && cq && cq.det && !cq.skip && fq && !cq.det.heads.some(hh => hh.s > .25) && greys.has(q - mk)) {
+          const gq = gripOf(fq), Lq = (clubL || 1.85 * Lc) * fsc, mh = motionHead(greys.get(q - mk), greys.get(q), greys.get(j), fw, fh, gq.x * fsc, gq.y * fsc, Lq);
+          if (mh) cq.det.heads.push({ x: mh.x / fsc, y: mh.y / fsc, s: .22, motion: true });
+        }
+      } catch (e) { /* no motion cue */ } }
       if (c && c.ok && prevClub && prevClub.ok) { let d = c.ang - prevClub.ang; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; c.dAng = d; }
       club.push(c); if (c && c.ok) prevClub = c; else if (prevClub) prevClub = Object.assign({}, prevClub, { ok: club.slice(-3).some(x => x && x.ok), dAng: 0 });
     } else { lm.push(null); wl.push(null); club.push(null); }
